@@ -41,6 +41,28 @@ class MobileMarlEnvCfg(DirectMarlEnvCfg):
         # We handle IMU assignments in the task config itself because 
         # it requires injecting dynamic fields into the SceneCfg for each robot.
 
+    def _add_robot(self, **kwargs):
+        from srb.core.env.common.base.env_cfg import BaseEnvCfg
+        
+        # Temporarily store original self.robot just in case
+        original_robot = getattr(self, "robot", None)
+        
+        for agent_id, robot_cfg in self.robots.items():
+            self.robot = robot_cfg
+            # Call the base class method to instantiate scene elements and ActionGroup configs,
+            # but specify unique prim paths per agent
+            BaseEnvCfg._add_robot(
+                self, 
+                prim_path=f"{{ENV_REGEX_NS}}/robot_{agent_id}",
+                prim_path_manipulator=f"{{ENV_REGEX_NS}}/manipulator_{agent_id}",
+                prim_path_payload=f"{{ENV_REGEX_NS}}/payload_{agent_id}",
+                prim_path_end_effector=f"{{ENV_REGEX_NS}}/end_effector_{agent_id}",
+            )
+            
+        # Restore or clean up
+        if original_robot is not None:
+            self.robot = original_robot
+
 
 class MobileMarlEnv(DirectMarlEnv):
     cfg: MobileMarlEnvCfg
@@ -51,7 +73,14 @@ class MobileMarlEnv(DirectMarlEnv):
         ## Get scene assets
         # We dynamically load IMUs for each robot if they were added to the scene
         self._imus = {
-            agent_id: self.scene[f"imu_{agent_id}"]
+            agent_id: getattr(self.scene, f"imu_{agent_id}")
             for agent_id in self.cfg.possible_agents
-            if f"imu_{agent_id}" in self.scene.keys()
+            if hasattr(self.scene, f"imu_{agent_id}")
+        }
+        
+        # Get robot articulations
+        self._robots = {
+            agent_id: self.scene[f"robot_{agent_id}"]
+            for agent_id in self.cfg.possible_agents
+            if f"robot_{agent_id}" in self.scene.keys()
         }
