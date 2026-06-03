@@ -25,8 +25,9 @@ class MarlWaypointTaskCfg(GroundMarlEnvCfg):
     
     # We define heterogeneous rovers!
     robots = {
-        "pragyan": assets.Pragyan(),
-        "perseverance": assets.Perseverance(),
+        "supporter": assets.Perseverance(),
+        "explorer_1": assets.Pragyan(),
+        "explorer_2": assets.Pragyan(),
     }
     
     # Target markers
