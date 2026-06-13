@@ -14,6 +14,7 @@ from srb.core.manager import ActionManager
 from srb.core.marker import VisualizationMarkers, VisualizationMarkersCfg
 from srb.core.sim import PreviewSurfaceCfg
 from srb.core.sim.spawners.shapes.extras.cfg import PinnedArrowCfg
+from srb.core.asset import AssetVariant
 from srb.utils.cfg import configclass
 from srb.utils.math import matrix_from_quat, subtract_frame_transforms
 
@@ -22,6 +23,13 @@ from srb.utils.math import matrix_from_quat, subtract_frame_transforms
 class MarlWaypointTaskCfg(GroundMarlEnvCfg):
     # Scene config uses GroundMarlSceneCfg
     scene: GroundMarlSceneCfg = GroundMarlSceneCfg()
+    
+    # Terrain Configuration
+    # By default, SRB uses AssetVariant.PROCEDURAL which loads the simforge_foundry 
+    # lunar surface generator (craters, rocks, slopes).
+    # To use a simple flat plane (e.g. for initial testing/debugging), change this to:
+    # scenery = assets.GroundPlane()
+    scenery: assets.Scenery | AssetVariant = AssetVariant.PROCEDURAL
     
     # We define heterogeneous rovers!
     robots = {
