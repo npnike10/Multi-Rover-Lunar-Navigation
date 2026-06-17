@@ -15,6 +15,10 @@ from srb.core.marker import VisualizationMarkers, VisualizationMarkersCfg
 from srb.core.sim import PreviewSurfaceCfg
 from srb.core.sim.spawners.shapes.extras.cfg import PinnedArrowCfg
 from srb.core.asset import AssetVariant
+
+# Import Isaac Lab sensor configs
+from isaaclab.sensors.ray_caster import RayCasterCfg, patterns
+
 from srb.utils.cfg import configclass
 from srb.utils.math import matrix_from_quat, subtract_frame_transforms
 
@@ -33,9 +37,9 @@ class MarlWaypointTaskCfg(GroundMarlEnvCfg):
     
     # We define heterogeneous rovers!
     robots = {
-        "supporter": assets.Perseverance(),
-        "explorer_1": assets.Pragyan(),
-        "explorer_2": assets.Pragyan(),
+        "supporter": assets.LeoRover(),
+        "explorer_1": assets.LeoRover(),
+        "explorer_2": assets.LeoRover(),
     }
     
     # Target markers
@@ -61,6 +65,29 @@ class MarlWaypointTaskCfg(GroundMarlEnvCfg):
     action_delay_steps: int = 0
     observation_delay_steps: int = 0
 
+    def __post_init__(self):
+        super().__post_init__()
+
+        # Dynamically inject RayCasters for each rover into the scene
+        for agent_id in self.possible_agents:
+            setattr(
+                self.scene,
+                f"raycaster_{agent_id}",
+                RayCasterCfg(
+                    prim_path=f"{{ENV_REGEX_NS}}/robot_{agent_id}/chassis",
+                    update_period=self.agent_rate,
+                    offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 0.5)), # Lifted 50cm above the chassis center
+                    mesh_prim_paths=["/World/.*/scenery", "/World/scenery", "/World/ground"], # Cast only against terrain
+                    pattern=patterns.GridPatternCfg(
+                        resolution=0.15,
+                        size=[1.5, 1.5], # Creates an 11x11 grid (121 points) spanning 1.5m
+                        direction=(0.0, 0.0, -1.0) # Pointing straight down
+                    ),
+                    max_distance=2.0,
+                    debug_vis=False,
+                )
+            )
+
 
 class MarlWaypointTask(GroundMarlEnv):
     cfg: MarlWaypointTaskCfg
@@ -84,6 +111,12 @@ class MarlWaypointTask(GroundMarlEnv):
             for agent_id in self.cfg.possible_agents
         }
 
+        ## Extract RayCasters from scene
+        self._raycasters = {
+            agent_id: getattr(self.scene, f"raycaster_{agent_id}")
+            for agent_id in self.cfg.possible_agents
+        }
+
         ## Initialize buffers
         self._goals = {
             agent_id: torch.zeros(self.num_envs, 7, device=self.device)
@@ -100,7 +133,8 @@ class MarlWaypointTask(GroundMarlEnv):
             for agent_id in self.cfg.possible_agents
         }
         self.observation_spaces = {
-            agent_id: gymnasium.spaces.Box(low=-float('inf'), high=float('inf'), shape=(4,))
+            # 4 state dims (x, y, dist, angle) + 121 raycast depth dims = 125
+            agent_id: gymnasium.spaces.Box(low=-float('inf'), high=float('inf'), shape=(125,))
             for agent_id in self.cfg.possible_agents
         }
         
@@ -151,7 +185,14 @@ class MarlWaypointTask(GroundMarlEnv):
             dist = torch.norm(pos2d, dim=-1, keepdim=True)
             angle = torch.atan2(tf_pos[:, 1], tf_pos[:, 0]).unsqueeze(-1)
             
-            obs_dict[agent_id] = torch.cat([pos2d, dist, angle], dim=-1)
+            # Terrain raycast depths (distance from sensor to ground, clamped to max_distance)
+            raycast_hits = self._raycasters[agent_id].data.ray_hits_w[..., 2] # Use Z coordinate of hit or similar, but distance is safer
+            raycast_depths = self._raycasters[agent_id].data.distance
+            
+            # Replace NaNs (no hit) with max_distance
+            raycast_depths = torch.nan_to_num(raycast_depths, nan=2.0)
+            
+            obs_dict[agent_id] = torch.cat([pos2d, dist, angle, raycast_depths], dim=-1)
             
             # Visualize
             self._target_marker.visualize(goal[:, 0:3], goal[:, 3:7])
