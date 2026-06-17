@@ -58,7 +58,7 @@ class GroundMarlEnvCfg(MobileMarlEnvCfg):
                     func=reset_root_state_uniform,
                     mode="reset",
                     params={
-                        "asset_cfg": SceneEntityCfg(agent_id),
+                        "asset_cfg": SceneEntityCfg(f"robot_{agent_id}"),
                         "pose_range": {
                             "x": (-0.5, 0.5),
                             "y": (-0.5, 0.5),

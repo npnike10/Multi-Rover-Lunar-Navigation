@@ -42,10 +42,17 @@ class MobileMarlEnvCfg(DirectMarlEnvCfg):
         # it requires injecting dynamic fields into the SceneCfg for each robot.
 
     def _add_robot(self, **kwargs):
+        from srb.core.action import ActionGroup
         from srb.core.env.common.base.env_cfg import BaseEnvCfg
         
         # Temporarily store original self.robot just in case
         original_robot = getattr(self, "robot", None)
+        
+        # We accumulate all action terms across robots into a shared ActionGroup.
+        # The base _add_robot() resets self.actions = ActionGroup() on each call,
+        # so we save/merge after each iteration.
+        accumulated_actions = ActionGroup()
+        map_cmd_fns = []
         
         for agent_id, robot_cfg in self.robots.items():
             self.robot = robot_cfg
@@ -57,6 +64,23 @@ class MobileMarlEnvCfg(DirectMarlEnvCfg):
                 prim_path_manipulator=f"{{ENV_REGEX_NS}}/manipulator_{agent_id}",
                 prim_path_payload=f"{{ENV_REGEX_NS}}/payload_{agent_id}",
                 prim_path_end_effector=f"{{ENV_REGEX_NS}}/end_effector_{agent_id}",
+            )
+            
+            # After each call, self.actions only contains action terms for this robot.
+            # Merge them into the accumulated group.
+            from srb.core.manager import ActionTermCfg
+            for attr_name, attr_val in self.actions.__dict__.items():
+                if isinstance(attr_val, ActionTermCfg):
+                    setattr(accumulated_actions, attr_name, attr_val)
+            if hasattr(self.actions, 'map_cmd_to_action'):
+                map_cmd_fns.append(self.actions.map_cmd_to_action)
+        
+        # Replace with the accumulated group containing all robots' action terms
+        self.actions = accumulated_actions
+        if map_cmd_fns:
+            import torch
+            self.actions.map_cmd_to_action = lambda twist, event: torch.cat(
+                [func(twist, event) for func in map_cmd_fns]
             )
             
         # Restore or clean up

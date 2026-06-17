@@ -185,14 +185,17 @@ class MarlWaypointTask(GroundMarlEnv):
             dist = torch.norm(pos2d, dim=-1, keepdim=True)
             angle = torch.atan2(tf_pos[:, 1], tf_pos[:, 0]).unsqueeze(-1)
             
-            # Terrain raycast depths (distance from sensor to ground, clamped to max_distance)
-            raycast_hits = self._raycasters[agent_id].data.ray_hits_w[..., 2] # Use Z coordinate of hit or similar, but distance is safer
-            raycast_depths = self._raycasters[agent_id].data.distance
+            # Terrain heights: compute relative height of each ray hit point 
+            # compared to the sensor origin (gives local elevation map)
+            raycaster = self._raycasters[agent_id]
+            sensor_pos_z = raycaster.data.pos_w[:, 2:3]  # (num_envs, 1)
+            hit_z = raycaster.data.ray_hits_w[..., 2]     # (num_envs, num_rays)
+            # Relative height: positive = ground above sensor level, negative = below (crater)
+            raycast_heights = hit_z - sensor_pos_z
+            # Replace inf/nan (no hit) with a safe default 
+            raycast_heights = torch.nan_to_num(raycast_heights, nan=-2.0, posinf=-2.0, neginf=-2.0)
             
-            # Replace NaNs (no hit) with max_distance
-            raycast_depths = torch.nan_to_num(raycast_depths, nan=2.0)
-            
-            obs_dict[agent_id] = torch.cat([pos2d, dist, angle, raycast_depths], dim=-1)
+            obs_dict[agent_id] = torch.cat([pos2d, dist, angle, raycast_heights], dim=-1)
             
             # Visualize
             self._target_marker.visualize(goal[:, 0:3], goal[:, 3:7])
