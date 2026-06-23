@@ -9,9 +9,8 @@ from srb.utils.cfg import configclass
 
 @configclass
 class MobileMarlSceneCfg(BaseSceneCfg):
-    pass
-    # We will let the specific tasks define the IMUs dynamically in __post_init__ 
-    # since we have multiple robots.
+    # MARL: robots are registered per-agent as robot_{agent_id}; no single .robot field
+    robot: None = None  # type: ignore
 
 
 @configclass

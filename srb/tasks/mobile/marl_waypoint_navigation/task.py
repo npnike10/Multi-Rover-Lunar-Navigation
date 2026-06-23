@@ -33,7 +33,8 @@ class MarlWaypointTaskCfg(GroundMarlEnvCfg):
     # lunar surface generator (craters, rocks, slopes).
     # To use a simple flat plane (e.g. for initial testing/debugging), change this to:
     # scenery = assets.GroundPlane()
-    scenery: assets.Scenery | AssetVariant = AssetVariant.PROCEDURAL
+    from srb.core.asset import Scenery
+    scenery: Scenery | AssetVariant = AssetVariant.PROCEDURAL
     
     # We define heterogeneous rovers!
     robots = {
@@ -60,28 +61,46 @@ class MarlWaypointTaskCfg(GroundMarlEnvCfg):
 
     episode_length_s: float = 60.0
     is_finite_horizon: bool = False
-    
+
     # Action/observation delays
     action_delay_steps: int = 0
     observation_delay_steps: int = 0
 
+    # ---------------------------------------------------------------------------
+    # Required DirectMARLEnvCfg space metadata (validated before __init__ runs)
+    # obs: 2 (rel x,y) + 1 (dist) + 1 (angle) + 121 (11x11 raycaster) = 125
+    # act: 2 (linear + angular velocity)
+    # state_space 0 = no centralized critic state (CTDE to be added later)
+    # ---------------------------------------------------------------------------
+    observation_spaces: dict = None  # type: ignore
+    action_spaces: dict = None  # type: ignore
+    state_space: int = 0
+
     def __post_init__(self):
+        # Force terrain stacking so RayCaster can use the global /World/scenery mesh
+        self.stack = True
+
+        # Populate space dicts BEFORE super().__post_init__() so validate() sees them
+        agent_ids = list(self.robots.keys())
+        self.observation_spaces = {aid: 125 for aid in agent_ids}
+        self.action_spaces = {aid: 2 for aid in agent_ids}
+        self.possible_agents = agent_ids
         super().__post_init__()
 
         # Dynamically inject RayCasters for each rover into the scene
-        for agent_id in self.possible_agents:
+        for agent_id in self.robots.keys():
             setattr(
                 self.scene,
                 f"raycaster_{agent_id}",
                 RayCasterCfg(
                     prim_path=f"{{ENV_REGEX_NS}}/robot_{agent_id}/chassis",
                     update_period=self.agent_rate,
-                    offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 0.5)), # Lifted 50cm above the chassis center
-                    mesh_prim_paths=["/World/.*/scenery", "/World/scenery", "/World/ground"], # Cast only against terrain
-                    pattern=patterns.GridPatternCfg(
+                    offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 0.5)),
+                    mesh_prim_paths=["/World/scenery"],
+                    pattern_cfg=patterns.GridPatternCfg(
                         resolution=0.15,
-                        size=[1.5, 1.5], # Creates an 11x11 grid (121 points) spanning 1.5m
-                        direction=(0.0, 0.0, -1.0) # Pointing straight down
+                        size=[1.5, 1.5],
+                        direction=(0.0, 0.0, -1.0),
                     ),
                     max_distance=2.0,
                     debug_vis=False,
@@ -113,11 +132,11 @@ class MarlWaypointTask(GroundMarlEnv):
 
         ## Extract RayCasters from scene
         self._raycasters = {
-            agent_id: getattr(self.scene, f"raycaster_{agent_id}")
+            agent_id: self.scene[f"raycaster_{agent_id}"]
             for agent_id in self.cfg.possible_agents
         }
 
-        ## Initialize buffers
+        ## Initialize goal buffers
         self._goals = {
             agent_id: torch.zeros(self.num_envs, 7, device=self.device)
             for agent_id in self.cfg.possible_agents
@@ -126,18 +145,6 @@ class MarlWaypointTask(GroundMarlEnv):
             self._goals[agent_id][:, 0:3] = self.scene.env_origins
             self._goals[agent_id][:, 3] = 1.0
 
-        # Define Observation and Action Spaces per agent
-        import gymnasium
-        self.action_spaces = {
-            agent_id: gymnasium.spaces.Box(low=-1.0, high=1.0, shape=(2,))
-            for agent_id in self.cfg.possible_agents
-        }
-        self.observation_spaces = {
-            # 4 state dims (x, y, dist, angle) + 121 raycast depth dims = 125
-            agent_id: gymnasium.spaces.Box(low=-float('inf'), high=float('inf'), shape=(125,))
-            for agent_id in self.cfg.possible_agents
-        }
-        
     def _reset_idx(self, env_ids: Sequence[int]):
         super()._reset_idx(env_ids)
 
@@ -146,11 +153,12 @@ class MarlWaypointTask(GroundMarlEnv):
             self._goals[agent_id][env_ids, 0:3] = self.scene.env_origins[env_ids] + torch.normal(
                 0, 5.0, size=(len(env_ids), 3), device=self.device
             )
-            self._goals[agent_id][env_ids, 2] = 0.5 # keep it near ground
+            self._goals[agent_id][env_ids, 2] = 0.5  # keep near ground
             self._goals[agent_id][env_ids, 3:7] = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device)
-            
+
             self._actions_dict[agent_id][env_ids] = 0.0
             self._prev_actions_dict[agent_id][env_ids] = 0.0
+
 
     def _pre_physics_step(self, actions: dict[str, torch.Tensor]) -> None:
         flat_actions_list = []
