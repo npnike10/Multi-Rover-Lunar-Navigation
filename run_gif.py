@@ -1,6 +1,4 @@
-import argparse
 from srb.core.app import AppLauncher
-
 launcher = AppLauncher(enable_cameras=True)
 app = launcher.app
 
@@ -8,45 +6,74 @@ import gymnasium as gym
 import torch
 import imageio
 import numpy as np
+import random
 
 # Import tasks to register them
 import srb.tasks
 
 env_name = "srb/marl_waypoint_navigation"
 from srb.tasks.mobile.marl_waypoint_navigation.task import MarlWaypointTaskCfg
+
+# Random seed so SimForge generates unique, rough terrain each run
+seed = random.randint(1, 9999)
+print(f"Using terrain seed: {seed}")
 cfg = MarlWaypointTaskCfg()
+cfg.seed = seed
+
 env = gym.make(env_name, cfg=cfg, render_mode="rgb_array")
-env.reset()
+obs, _ = env.reset()
 
 frames = []
-# Run for 100 steps
-for i in range(100):
-    # Sample random actions for each agent (convert to torch tensor with batch dim)
+NUM_STEPS = 500
+
+# Drastically different directions so rovers spread apart and never clash:
+#   supporter  → hard left arc
+#   explorer_1 → hard right arc  
+#   explorer_2 → straight backward
+fixed_actions = {
+    "supporter":  torch.tensor([[ 0.9, -1.0]], dtype=torch.float32, device=env.unwrapped.device),
+    "explorer_1": torch.tensor([[ 0.9,  1.0]], dtype=torch.float32, device=env.unwrapped.device),
+    "explorer_2": torch.tensor([[-0.9,  0.0]], dtype=torch.float32, device=env.unwrapped.device),
+}
+
+
+def update_camera(env):
+    """Keep camera locked 5m behind and 4m above the supporter, looking at it."""
+    robot = env.unwrapped._robots["supporter"]
+    pos = robot.data.root_pos_w[0].cpu().numpy()
+    # Low angle (35 deg elevation) from behind to show terrain relief clearly
+    env.unwrapped.sim.set_camera_view(
+        eye=(float(pos[0]) - 5.0, float(pos[1]) - 5.0, float(pos[2]) + 4.0),
+        target=(float(pos[0]), float(pos[1]), float(pos[2])),
+    )
+
+
+# Set initial camera
+update_camera(env)
+
+for i in range(NUM_STEPS):
+    # Small noise keeps motion natural but preserves divergent directions
     actions = {
-        agent: torch.tensor(
-            env.action_space(agent).sample(), 
-            dtype=torch.float32, 
-            device=env.unwrapped.device
-        ).unsqueeze(0)  # (action_dim,) -> (1, action_dim)
-        for agent in env.possible_agents
+        agent: fixed_actions[agent] + torch.randn_like(fixed_actions[agent]) * 0.04
+        for agent in env.unwrapped.possible_agents
     }
-    
-    # In SRB/IsaacLab MARL, actions are passed as a dict
+
     obs, rewards, dones, truncs, infos = env.step(actions)
-    
-    # Render the current frame
+
+    # Follow the supporter rover
+    update_camera(env)
+
     img = env.render()
     if img is not None:
         frames.append(img)
-    
-    if i % 10 == 0:
-        print(f"Step {i}/100")
 
-# Save as GIF
-output_path = "/home/niket/.gemini/antigravity-cli/brain/920fbfba-dbe6-4f10-8774-60fc4b385b6f/marl_navigation.gif"
-print(f"Saving GIF to {output_path}...")
-imageio.mimsave(output_path, frames, fps=30)
-print("Done!")
+    if i % 50 == 0:
+        print(f"Step {i}/{NUM_STEPS}  rewards={rewards}")
+
+output_path = "/home/niket/Documents/TRG/MRLN/marl_navigation.gif"
+print(f"Saving GIF ({len(frames)} frames) to {output_path}...")
+imageio.mimsave(output_path, frames, fps=20, loop=0)  # 20fps = natural speed
+print(f"Done! Seed was: {seed}")
 
 env.close()
 app.close()

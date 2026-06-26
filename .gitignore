@@ -38,3 +38,6 @@ wandb/
 
 ## Dump files
 **/core.*
+
+## GIFs
+*.gif
