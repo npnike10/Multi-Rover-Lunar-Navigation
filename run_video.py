@@ -70,9 +70,12 @@ for i in range(NUM_STEPS):
     if i % 50 == 0:
         print(f"Step {i}/{NUM_STEPS}  rewards={rewards}")
 
-output_path = "/home/niket/Documents/TRG/MRLN/marl_navigation.gif"
-print(f"Saving GIF ({len(frames)} frames) to {output_path}...")
-imageio.mimsave(output_path, frames, fps=20, loop=0)  # 20fps = natural speed
+output_path = "/home/niket/Documents/TRG/MRLN/marl_navigation.mp4"
+print(f"Saving MP4 ({len(frames)} frames) to {output_path}...")
+writer = imageio.get_writer(output_path, fps=20, codec='libx264', quality=8)
+for frame in frames:
+    writer.append_data(frame)
+writer.close()
 print(f"Done! Seed was: {seed}")
 
 env.close()

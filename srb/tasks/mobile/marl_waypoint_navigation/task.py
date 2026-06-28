@@ -72,8 +72,12 @@ class MarlWaypointTaskCfg(GroundMarlEnvCfg):
             considered to have reached its target. Default 0.5 m.
         target_spawn_radius: Maximum distance (m) from env origin at which
             explorer targets are randomly spawned. Default 5.0 m.
-        target_spawn_height: Height (m) at which target markers float above
-            the terrain. Default 0.5 m.
+        target_spawn_min_radius: Minimum distance (m) from env origin at
+            which explorer targets are spawned. Ensures targets are not too
+            close to the starting area. Default 2.0 m.
+        target_min_separation: Minimum distance (m) between the two explorer
+            targets. Ensures explorers must navigate to distinct locations.
+            Default 3.0 m. Uses rejection sampling (max 100 attempts).
         safe_distance: Minimum safe distance (m) between any two rovers.
             If None (default), automatically set to the length of the longest
             rover among all agents. Can be overridden with a float.
@@ -109,18 +113,34 @@ class MarlWaypointTaskCfg(GroundMarlEnvCfg):
     supporter_agent: str = "supporter"
 
     # -- Visual markers (explorers only) --------------------------------------
-    target_marker_cfg: VisualizationMarkersCfg = VisualizationMarkersCfg(
-        prim_path="/Visuals/target",
+    target_1_marker_cfg: VisualizationMarkersCfg = VisualizationMarkersCfg(
+        prim_path="/Visuals/target_1",
         markers={
             "target": PinnedArrowCfg(
-                pin_radius=0.01,
+                pin_radius=0.03,
                 pin_length=2.0,
-                tail_radius=0.01,
-                tail_length=0.2,
-                head_radius=0.04,
-                head_length=0.08,
+                tail_radius=0.1,
+                tail_length=0.4,
+                head_radius=0.2,
+                head_length=0.4,
                 visual_material=PreviewSurfaceCfg(
                     emissive_color=(0.2, 0.2, 0.8)
+                ),
+            )
+        },
+    )
+    target_2_marker_cfg: VisualizationMarkersCfg = VisualizationMarkersCfg(
+        prim_path="/Visuals/target_2",
+        markers={
+            "target": PinnedArrowCfg(
+                pin_radius=0.03,
+                pin_length=2.0,
+                tail_radius=0.1,
+                tail_length=0.4,
+                head_radius=0.2,
+                head_length=0.4,
+                visual_material=PreviewSurfaceCfg(
+                    emissive_color=(0.2, 0.8, 0.2)
                 ),
             )
         },
@@ -132,8 +152,9 @@ class MarlWaypointTaskCfg(GroundMarlEnvCfg):
 
     # -- Goal parameters ------------------------------------------------------
     goal_reached_threshold: float = 0.5   # meters
-    target_spawn_radius: float = 5.0      # meters from env origin
-    target_spawn_height: float = 0.5      # meters above ground
+    target_spawn_radius: float = 5.0      # max meters from env origin
+    target_spawn_min_radius: float = 2.0  # min meters from env origin
+    target_min_separation: float = 3.0    # min meters between the two targets
 
     # -- Safety parameters ----------------------------------------------------
     safe_distance: float | None = None    # None = auto (longest rover length)
@@ -174,6 +195,16 @@ class MarlWaypointTaskCfg(GroundMarlEnvCfg):
         self.state_space = 414
 
         super().__post_init__()
+
+        # -- Fix base GroundMarlEnv randomize events --
+        # GroundMarlEnv spawns robots 0.5m in the air with Z velocity.
+        # We override this to spawn them on the ground so they don't bounce.
+        for agent_id in self.robots.keys():
+            event_cfg = getattr(self.events, f"randomize_{agent_id}_state")
+            event_cfg.params["pose_range"]["z"] = (0.05, 0.05)  # just above ground
+            event_cfg.params["velocity_range"]["z"] = (0.0, 0.0)
+            event_cfg.params["velocity_range"]["roll"] = (0.0, 0.0)
+            event_cfg.params["velocity_range"]["pitch"] = (0.0, 0.0)
 
         # ---- Per-rover sensor injection ----
         for agent_id, robot_cfg in self.robots.items():
@@ -240,7 +271,8 @@ class MarlWaypointTask(GroundMarlEnv):
         super().__init__(cfg, **kwargs)
 
         # -- Visual markers (explorer targets only) --
-        self._target_marker = VisualizationMarkers(self.cfg.target_marker_cfg)
+        self._target_1_marker = VisualizationMarkers(self.cfg.target_1_marker_cfg)
+        self._target_2_marker = VisualizationMarkers(self.cfg.target_2_marker_cfg)
 
         # -- Action manager for heterogeneous rover mapping --
         self.action_manager = ActionManager(self.cfg.actions, env=self)
@@ -278,7 +310,6 @@ class MarlWaypointTask(GroundMarlEnv):
         }
         for aid in self.cfg.explorer_agents:
             self._goals[aid][:, :3] = self.scene.env_origins[:, :3]
-            self._goals[aid][:, 2] = self.cfg.target_spawn_height
 
         # -- Per-explorer "reached" flag --
         self._explorer_reached = {
@@ -319,22 +350,53 @@ class MarlWaypointTask(GroundMarlEnv):
     #  Reset                                                                  #
     # --------------------------------------------------------------------- #
 
+    def _sample_target_xy(self, n: int) -> torch.Tensor:
+        """Sample n target XY offsets in an annular region.
+
+        Samples uniformly by area within the annulus defined by
+        [target_spawn_min_radius, target_spawn_radius]. Targets are placed
+        at ground level (env_origins z).
+
+        Returns:
+            ``(n, 2)`` tensor of XY offsets from env origin.
+        """
+        r_min = self.cfg.target_spawn_min_radius
+        r_max = self.cfg.target_spawn_radius
+        # Uniform sampling by area: r = sqrt(U * (r_max² - r_min²) + r_min²)
+        u = torch.rand(n, device=self.device)
+        r = torch.sqrt(u * (r_max**2 - r_min**2) + r_min**2)
+        theta = torch.rand(n, device=self.device) * 2.0 * torch.pi
+        xy = torch.stack([r * torch.cos(theta), r * torch.sin(theta)], dim=-1)
+        return xy  # (n, 2)
+
     def _reset_idx(self, env_ids: Sequence[int]):
         super()._reset_idx(env_ids)
 
         n = len(env_ids)
+        origins = self.scene.env_origins[env_ids]  # (n, 3)
+        explorer_ids = self.cfg.explorer_agents     # ["explorer_1", "explorer_2"]
 
-        # -- Reset explorer targets --
-        for aid in self.cfg.explorer_agents:
-            offset = torch.empty(n, 3, device=self.device)
-            offset[:, :2] = (
-                (torch.rand(n, 2, device=self.device) * 2.0 - 1.0)
-                * self.cfg.target_spawn_radius
-            )
-            offset[:, 2] = 0.0
+        # -- Reset explorer targets with min separation constraint --
+        # Sample target 1
+        xy1 = self._sample_target_xy(n)  # (n, 2)
 
-            self._goals[aid][env_ids] = self.scene.env_origins[env_ids] + offset
-            self._goals[aid][env_ids, 2] = self.cfg.target_spawn_height
+        # Sample target 2 with rejection sampling to enforce min separation
+        xy2 = self._sample_target_xy(n)  # (n, 2)
+        for attempt in range(100):
+            dist = torch.norm(xy1 - xy2, dim=-1)  # (n,)
+            too_close = dist < self.cfg.target_min_separation
+            if not too_close.any():
+                break
+            # Resample only the environments where targets are too close
+            m = too_close.sum().item()
+            xy2[too_close] = self._sample_target_xy(m)
+
+        # Assign targets (at ground level = env_origins z)
+        for i, aid in enumerate(explorer_ids):
+            xy = xy1 if i == 0 else xy2
+            self._goals[aid][env_ids, 0] = origins[:, 0] + xy[:, 0]
+            self._goals[aid][env_ids, 1] = origins[:, 1] + xy[:, 1]
+            self._goals[aid][env_ids, 2] = origins[:, 2]  # ground level
 
         # -- Reset flags and buffers --
         for aid in self.cfg.explorer_agents:
@@ -462,11 +524,15 @@ class MarlWaypointTask(GroundMarlEnv):
             obs[aid] = torch.cat(parts, dim=-1)  # (N, 139)
 
         # Visualize all explorer target markers in one call
-        if marker_pos_list:
-            self._target_marker.visualize(
-                torch.cat(marker_pos_list, dim=0),
-                torch.cat(marker_quat_list, dim=0),
-            )
+        if hasattr(self, "_target_1_marker"):
+            id_quat = torch.zeros(self.num_envs, 4, device=self.device)
+            id_quat[:, 0] = 1.0
+            pos1 = self._goals["explorer_1"].clone()
+            pos1[:, 2] += 1.0  # Shift up to prevent being buried
+            pos2 = self._goals["explorer_2"].clone()
+            pos2[:, 2] += 1.0
+            self._target_1_marker.visualize(pos1, id_quat)
+            self._target_2_marker.visualize(pos2, id_quat)
 
         return obs
 
