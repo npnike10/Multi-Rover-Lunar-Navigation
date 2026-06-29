@@ -38,13 +38,11 @@ fixed_actions = {
 
 
 def update_camera(env):
-    """Keep camera locked 5m behind and 4m above the supporter, looking at it."""
-    robot = env.unwrapped._robots["supporter"]
-    pos = robot.data.root_pos_w[0].cpu().numpy()
-    # Low angle (35 deg elevation) from behind to show terrain relief clearly
+    """Static bird's-eye isometric view covering the entire navigation area."""
+    # Look at origin from a high, wide angle so we see all rovers and targets
     env.unwrapped.sim.set_camera_view(
-        eye=(float(pos[0]) - 5.0, float(pos[1]) - 5.0, float(pos[2]) + 4.0),
-        target=(float(pos[0]), float(pos[1]), float(pos[2])),
+        eye=(-12.0, -12.0, 15.0),
+        target=(0.0, 0.0, 0.0),
     )
 
 

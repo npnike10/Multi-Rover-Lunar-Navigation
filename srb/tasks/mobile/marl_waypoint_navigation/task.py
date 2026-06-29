@@ -56,12 +56,61 @@ from srb.utils.math import matrix_from_quat, subtract_frame_transforms, quat_to_
 
 
 ###############################################################################
+# Scene Configuration
+###############################################################################
+
+import isaaclab.sim as sim_utils
+from isaaclab.assets import RigidObjectCfg
+
+@configclass
+class MarlWaypointSceneCfg(GroundMarlSceneCfg):
+    target_1: RigidObjectCfg = RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/target_1",
+        spawn=sim_utils.ConeCfg(
+            radius=0.2,
+            height=0.4,
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                kinematic_enabled=True,
+                disable_gravity=True,
+                enable_gyroscopic_forces=False,
+            ),
+            collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=False),
+            visual_material=PreviewSurfaceCfg(
+                diffuse_color=(0.0, 0.0, 1.0),
+                emissive_color=(0.0, 0.0, 1.0)
+            ),
+        ),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.0, 0.0, 5.0)),
+    )
+    
+    target_2: RigidObjectCfg = RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/target_2",
+        spawn=sim_utils.ConeCfg(
+            radius=0.2,
+            height=0.4,
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                kinematic_enabled=True,
+                disable_gravity=True,
+                enable_gyroscopic_forces=False,
+            ),
+            collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=False),
+            visual_material=PreviewSurfaceCfg(
+                diffuse_color=(0.0, 1.0, 0.0),
+                emissive_color=(0.0, 1.0, 0.0)
+            ),
+        ),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.0, 0.0, 5.0)),
+    )
+
+###############################################################################
 # Configuration
 ###############################################################################
 
 
 @configclass
 class MarlWaypointTaskCfg(GroundMarlEnvCfg):
+    
+
     """Configuration for the MARL Waypoint Navigation environment.
 
     Dec-POMDP with 3 lunar rovers (1 supporter + 2 explorers) on procedurally
@@ -95,7 +144,7 @@ class MarlWaypointTaskCfg(GroundMarlEnvCfg):
     """
 
     # -- Scene ----------------------------------------------------------------
-    scene: GroundMarlSceneCfg = GroundMarlSceneCfg()
+    scene: MarlWaypointSceneCfg = MarlWaypointSceneCfg(env_spacing=32.0)
 
     # -- Terrain --------------------------------------------------------------
     from srb.core.asset import Scenery
@@ -112,39 +161,6 @@ class MarlWaypointTaskCfg(GroundMarlEnvCfg):
     explorer_agents: list = ["explorer_1", "explorer_2"]
     supporter_agent: str = "supporter"
 
-    # -- Visual markers (explorers only) --------------------------------------
-    target_1_marker_cfg: VisualizationMarkersCfg = VisualizationMarkersCfg(
-        prim_path="/Visuals/target_1",
-        markers={
-            "target": PinnedArrowCfg(
-                pin_radius=0.03,
-                pin_length=2.0,
-                tail_radius=0.1,
-                tail_length=0.4,
-                head_radius=0.2,
-                head_length=0.4,
-                visual_material=PreviewSurfaceCfg(
-                    emissive_color=(0.2, 0.2, 0.8)
-                ),
-            )
-        },
-    )
-    target_2_marker_cfg: VisualizationMarkersCfg = VisualizationMarkersCfg(
-        prim_path="/Visuals/target_2",
-        markers={
-            "target": PinnedArrowCfg(
-                pin_radius=0.03,
-                pin_length=2.0,
-                tail_radius=0.1,
-                tail_length=0.4,
-                head_radius=0.2,
-                head_length=0.4,
-                visual_material=PreviewSurfaceCfg(
-                    emissive_color=(0.2, 0.8, 0.2)
-                ),
-            )
-        },
-    )
 
     # -- Episode --------------------------------------------------------------
     episode_length_s: float = 60.0
@@ -199,8 +215,17 @@ class MarlWaypointTaskCfg(GroundMarlEnvCfg):
         # -- Fix base GroundMarlEnv randomize events --
         # GroundMarlEnv spawns robots 0.5m in the air with Z velocity.
         # We override this to spawn them on the ground so they don't bounce.
+        # And separate them so they don't clash at spawn.
+        spawn_offsets = {
+            "supporter": (-0.5, 0.0),
+            "explorer_1": (0.5, -0.5),
+            "explorer_2": (0.5, 0.5),
+        }
         for agent_id in self.robots.keys():
             event_cfg = getattr(self.events, f"randomize_{agent_id}_state")
+            dx, dy = spawn_offsets.get(agent_id, (0.0, 0.0))
+            event_cfg.params["pose_range"]["x"] = (dx - 0.2, dx + 0.2)
+            event_cfg.params["pose_range"]["y"] = (dy - 0.2, dy + 0.2)
             event_cfg.params["pose_range"]["z"] = (0.05, 0.05)  # just above ground
             event_cfg.params["velocity_range"]["z"] = (0.0, 0.0)
             event_cfg.params["velocity_range"]["roll"] = (0.0, 0.0)
@@ -270,11 +295,7 @@ class MarlWaypointTask(GroundMarlEnv):
     def __init__(self, cfg: MarlWaypointTaskCfg, **kwargs):
         super().__init__(cfg, **kwargs)
 
-        # -- Visual markers (explorer targets only) --
-        self._target_1_marker = VisualizationMarkers(self.cfg.target_1_marker_cfg)
-        self._target_2_marker = VisualizationMarkers(self.cfg.target_2_marker_cfg)
 
-        # -- Action manager for heterogeneous rover mapping --
         self.action_manager = ActionManager(self.cfg.actions, env=self)
 
         # -- Per-agent action buffers (for action-rate penalty) --
@@ -397,6 +418,14 @@ class MarlWaypointTask(GroundMarlEnv):
             self._goals[aid][env_ids, 0] = origins[:, 0] + xy[:, 0]
             self._goals[aid][env_ids, 1] = origins[:, 1] + xy[:, 1]
             self._goals[aid][env_ids, 2] = origins[:, 2]  # ground level
+            
+            # Update visual target poses in simulation
+            target_obj = self.scene[f"target_{i+1}"]
+            target_pose = torch.zeros((len(env_ids), 7), device=self.device)
+            target_pose[:, :3] = self._goals[aid][env_ids]
+            target_pose[:, 2] += 1.5  # Hover 1.5m above ground
+            target_pose[:, 3:7] = torch.tensor([0.0, 0.0, 1.0, 0.0], device=self.device) # Rotate 180 deg (point down)
+            target_obj.write_root_pose_to_sim(target_pose, env_ids=env_ids)
 
         # -- Reset flags and buffers --
         for aid in self.cfg.explorer_agents:
@@ -522,17 +551,6 @@ class MarlWaypointTask(GroundMarlEnv):
             parts.append(self._get_terrain_features(aid))
 
             obs[aid] = torch.cat(parts, dim=-1)  # (N, 139)
-
-        # Visualize all explorer target markers in one call
-        if hasattr(self, "_target_1_marker"):
-            id_quat = torch.zeros(self.num_envs, 4, device=self.device)
-            id_quat[:, 0] = 1.0
-            pos1 = self._goals["explorer_1"].clone()
-            pos1[:, 2] += 1.0  # Shift up to prevent being buried
-            pos2 = self._goals["explorer_2"].clone()
-            pos2[:, 2] += 1.0
-            self._target_1_marker.visualize(pos1, id_quat)
-            self._target_2_marker.visualize(pos2, id_quat)
 
         return obs
 
