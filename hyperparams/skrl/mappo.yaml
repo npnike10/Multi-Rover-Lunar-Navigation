@@ -19,7 +19,7 @@ models:
     clip_actions: False
     network:
       - name: net
-        input: SHARED_STATES
+        input: STATES
         layers: [256, 256, 256]
         activations: elu
     output: ONE

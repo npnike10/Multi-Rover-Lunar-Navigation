@@ -2357,6 +2357,12 @@ def parse_cli_args() -> argparse.Namespace:
 class PermissiveChoiceArgumentParser(argparse.ArgumentParser):
     def _check_value(self, action, value):
         if action.choices is not None and value not in action.choices:
+            if isinstance(action, AutoNamespaceTaskAction):
+                namespace_prefix = f"{action.NAMESPACE}/"
+                if value.startswith(namespace_prefix) and (
+                    value.removeprefix(namespace_prefix) in action.choices
+                ):
+                    return
             warnings.warn(
                 f"Choice '{value}' is not (yet) a known option from the registered set {{{', '.join(action.choices)}}}.",
                 category=UserWarning,
@@ -2442,6 +2448,7 @@ class SupportedAlgo(str, Enum):
     SKRL_AMP = auto()
     SKRL_CEM = auto()
     SKRL_DDPG = auto()
+    SKRL_MAPPO = auto()
     SKRL_PPO = auto()
     SKRL_PPO_RNN = auto()
     SKRL_RPO = auto()

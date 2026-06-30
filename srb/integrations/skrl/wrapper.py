@@ -3,7 +3,7 @@ from typing import Any, Mapping, Sequence, Tuple
 
 import gymnasium
 import torch
-from skrl.envs.wrappers.torch import IsaacLabWrapper
+from skrl.envs.wrappers.torch import IsaacLabMultiAgentWrapper, IsaacLabWrapper
 from skrl.utils.spaces.torch import (
     flatten_tensorized_space,
     tensorize_space,
@@ -113,3 +113,64 @@ class SkrlEnvWrapper(IsaacLabWrapper):
         if not self._obs_keys:
             return observations
         return {key: observations[key] for key in self._obs_keys}
+
+
+class SkrlMultiAgentEnvWrapper(IsaacLabMultiAgentWrapper):
+    def __init__(self, env: Any) -> None:
+        super().__init__(env)
+
+        self._clip_actions_min = {
+            agent: torch.tensor(
+                space.low,
+                device=self.device,
+                dtype=torch.float32,
+            )
+            for agent, space in self.action_spaces.items()
+            if isinstance(space, gymnasium.spaces.Box)
+        }
+        self._clip_actions_max = {
+            agent: torch.tensor(
+                space.high,
+                device=self.device,
+                dtype=torch.float32,
+            )
+            for agent, space in self.action_spaces.items()
+            if isinstance(space, gymnasium.spaces.Box)
+        }
+
+    @cached_property
+    def action_spaces(self) -> Mapping[str, gymnasium.Space]:
+        return {
+            agent: (
+                gymnasium.spaces.Box(
+                    low=-1.0,
+                    high=1.0,
+                    shape=space.shape,
+                    dtype=space.dtype,
+                )
+                if isinstance(space, gymnasium.spaces.Box)
+                else space
+            )
+            for agent, space in super().action_spaces.items()
+        }
+
+    def step(
+        self, actions: Mapping[str, torch.Tensor]
+    ) -> Tuple[
+        Mapping[str, torch.Tensor],
+        Mapping[str, torch.Tensor],
+        Mapping[str, torch.Tensor],
+        Mapping[str, torch.Tensor],
+        Any,
+    ]:
+        actions = {
+            agent: torch.clamp(
+                action,
+                min=self._clip_actions_min[agent],
+                max=self._clip_actions_max[agent],
+            )
+            if agent in self._clip_actions_min
+            else action
+            for agent, action in actions.items()
+        }
+        return super().step(actions)
