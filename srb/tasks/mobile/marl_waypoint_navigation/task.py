@@ -149,6 +149,7 @@ class MarlWaypointTaskCfg(GroundMarlEnvCfg):
     # -- Terrain --------------------------------------------------------------
     from srb.core.asset import Scenery
     scenery: Scenery | AssetVariant = AssetVariant.PROCEDURAL
+    debug_flat_scenery: bool = False
 
     # -- Rovers ---------------------------------------------------------------
     robots = {
@@ -197,6 +198,9 @@ class MarlWaypointTaskCfg(GroundMarlEnvCfg):
     state_space: int = 0             # set in __post_init__
 
     def __post_init__(self):
+        if self.debug_flat_scenery:
+            self.scenery = assets.GroundPlane()
+
         # Terrain must be stacked so the single /World/scenery mesh is
         # visible to all RayCasters.
         self.stack = True
@@ -213,9 +217,9 @@ class MarlWaypointTaskCfg(GroundMarlEnvCfg):
         super().__post_init__()
 
         # -- Fix base GroundMarlEnv randomize events --
-        # GroundMarlEnv spawns robots 0.5m in the air with Z velocity.
-        # We override this to spawn them on the ground so they don't bounce.
-        # And separate them so they don't clash at spawn.
+        # Keep the rovers separated and reset them above the terrain.
+        # Starting near z=0 can place wheels/chassis inside uneven procedural
+        # terrain, which is enough to poison GPU PhysX with CUDA error 700.
         spawn_offsets = {
             "supporter": (-0.5, 0.0),
             "explorer_1": (0.5, -0.5),
@@ -226,7 +230,7 @@ class MarlWaypointTaskCfg(GroundMarlEnvCfg):
             dx, dy = spawn_offsets.get(agent_id, (0.0, 0.0))
             event_cfg.params["pose_range"]["x"] = (dx - 0.2, dx + 0.2)
             event_cfg.params["pose_range"]["y"] = (dy - 0.2, dy + 0.2)
-            event_cfg.params["pose_range"]["z"] = (0.05, 0.05)  # just above ground
+            event_cfg.params["pose_range"]["z"] = (0.4, 0.5)
             event_cfg.params["velocity_range"]["z"] = (0.0, 0.0)
             event_cfg.params["velocity_range"]["roll"] = (0.0, 0.0)
             event_cfg.params["velocity_range"]["pitch"] = (0.0, 0.0)

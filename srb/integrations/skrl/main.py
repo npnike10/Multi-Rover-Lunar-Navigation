@@ -1,5 +1,7 @@
+import sys
+import types
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import gymnasium
 from isaacsim.simulation_app import SimulationApp
@@ -16,6 +18,21 @@ if TYPE_CHECKING:
     from srb._typing import AnyEnv, AnyEnvCfg
 
 FRAMEWORK_NAME = "skrl"
+
+
+def _install_torch_dynamo_graph_break_stub() -> None:
+    """Provide the optimizer graph-break hook without importing Torch Dynamo."""
+    import torch
+
+    dynamo_module = sys.modules.get("torch._dynamo")
+    if dynamo_module is None:
+        dynamo_module = types.ModuleType("torch._dynamo")
+        sys.modules["torch._dynamo"] = dynamo_module
+
+    if not hasattr(dynamo_module, "graph_break"):
+        dynamo_module.graph_break = lambda *args, **kwargs: None  # type: ignore[attr-defined]
+
+    torch._dynamo = dynamo_module  # type: ignore[attr-defined]
 
 
 def _unwrap_torch_optimizer_dynamo_wrappers() -> None:
@@ -35,14 +52,61 @@ def _unwrap_torch_optimizer_dynamo_wrappers() -> None:
     except Exception:
         pass
 
-    try:
-        import torch.optim.adam as adam_module
 
-        _unwrap_method(adam_module.Adam, "step")
-        if (wrapped := getattr(adam_module.adam, "__wrapped__", None)) is not None:
-            adam_module.adam = wrapped
-    except Exception:
-        pass
+def _install_native_wandb_scalar_logging() -> None:
+    """Mirror skrl's TensorBoard scalar writes to native WandB history."""
+
+    def _tracking_payload(agent: Any) -> dict[str, float]:
+        import numpy as np
+
+        payload: dict[str, float] = {}
+        for key, values in agent.tracking_data.items():
+            if not values:
+                continue
+            if key.endswith("(min)"):
+                value = np.min(values)
+            elif key.endswith("(max)"):
+                value = np.max(values)
+            else:
+                value = np.mean(values)
+            payload[key] = float(value)
+        return payload
+
+    def _wrap_write_tracking_data(cls: type) -> None:
+        original = getattr(cls, "write_tracking_data")
+        if getattr(original, "_srb_wandb_wrapped", False):
+            return
+
+        def write_tracking_data(self: Any, timestep: int, timesteps: int) -> None:
+            payload = (
+                _tracking_payload(self)
+                if self.cfg.get("experiment", {}).get("wandb", False)
+                else {}
+            )
+            original(self, timestep, timesteps)
+            if not payload:
+                return
+
+            try:
+                import wandb
+
+                if wandb.run is not None:
+                    wandb.log(payload, step=timestep)
+            except Exception as exc:
+                logging.warning(f"Failed to log skrl metrics to WandB: {exc}")
+
+        write_tracking_data.__wrapped__ = original  # type: ignore[attr-defined]
+        write_tracking_data._srb_wandb_wrapped = True  # type: ignore[attr-defined]
+        setattr(cls, "write_tracking_data", write_tracking_data)
+
+    try:
+        from skrl.agents.torch.base import Agent
+        from skrl.multi_agents.torch.base import MultiAgent
+
+        _wrap_write_tracking_data(Agent)
+        _wrap_write_tracking_data(MultiAgent)
+    except Exception as exc:
+        logging.warning(f"Failed to install native WandB scalar logging: {exc}")
 
 
 def run(
@@ -80,6 +144,9 @@ def run(
     agent_cfg["seed"] = env_cfg.seed if env_cfg else 0
     agent_cfg["agent"]["experiment"]["directory"] = logdir.parent
     agent_cfg["agent"]["experiment"]["experiment_name"] = logdir
+    if agent_cfg["agent"]["experiment"].get("wandb", False):
+        wandb_kwargs = agent_cfg["agent"]["experiment"].setdefault("wandb_kwargs", {})
+        wandb_kwargs.setdefault("sync_tensorboard", False)
 
     unwrapped_env = getattr(env, "unwrapped", env)
     is_multi_agent = hasattr(unwrapped_env, "possible_agents")
@@ -101,8 +168,13 @@ def run(
     )
 
     # Create the runner
+    _install_torch_dynamo_graph_break_stub()
     _unwrap_torch_optimizer_dynamo_wrappers()
+    from skrl import config as skrl_config
     from skrl.utils.runner.torch import Runner
+
+    skrl_config.torch.device = env.device
+    _install_native_wandb_scalar_logging()
 
     runner = Runner(
         env,  # type: ignore

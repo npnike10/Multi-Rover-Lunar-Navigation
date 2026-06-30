@@ -32,6 +32,7 @@ class SkrlEnvWrapper(IsaacLabWrapper):
             device=self.device,
             dtype=torch.float32,
         )
+        self._warned_nonfinite_actions = False
 
     @cached_property
     def action_space(self) -> gymnasium.Space:
@@ -76,6 +77,13 @@ class SkrlEnvWrapper(IsaacLabWrapper):
     def step(
         self, actions: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Any]:
+        if not torch.isfinite(actions).all():
+            if not self._warned_nonfinite_actions:
+                from srb.utils import logging
+
+                logging.warning("Non-finite skrl actions detected; replacing with bounded values.")
+                self._warned_nonfinite_actions = True
+            actions = torch.nan_to_num(actions, nan=0.0, posinf=1.0, neginf=-1.0)
         actions = torch.clamp(
             actions, min=self._clip_actions_min, max=self._clip_actions_max
         )
@@ -118,6 +126,7 @@ class SkrlEnvWrapper(IsaacLabWrapper):
 class SkrlMultiAgentEnvWrapper(IsaacLabMultiAgentWrapper):
     def __init__(self, env: Any) -> None:
         super().__init__(env)
+        self._warned_nonfinite_actions: set[str] = set()
 
         self._clip_actions_min = {
             agent: torch.tensor(
@@ -163,14 +172,23 @@ class SkrlMultiAgentEnvWrapper(IsaacLabMultiAgentWrapper):
         Mapping[str, torch.Tensor],
         Any,
     ]:
-        actions = {
-            agent: torch.clamp(
-                action,
-                min=self._clip_actions_min[agent],
-                max=self._clip_actions_max[agent],
-            )
-            if agent in self._clip_actions_min
-            else action
-            for agent, action in actions.items()
-        }
+        bounded_actions = {}
+        for agent, action in actions.items():
+            if not torch.isfinite(action).all():
+                if agent not in self._warned_nonfinite_actions:
+                    from srb.utils import logging
+
+                    logging.warning(
+                        f"Non-finite skrl actions detected for agent '{agent}'; replacing with bounded values."
+                    )
+                    self._warned_nonfinite_actions.add(agent)
+                action = torch.nan_to_num(action, nan=0.0, posinf=1.0, neginf=-1.0)
+            if agent in self._clip_actions_min:
+                action = torch.clamp(
+                    action,
+                    min=self._clip_actions_min[agent],
+                    max=self._clip_actions_max[agent],
+                )
+            bounded_actions[agent] = action
+        actions = bounded_actions
         return super().step(actions)

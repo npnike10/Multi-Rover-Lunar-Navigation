@@ -1,3 +1,4 @@
+import copy
 from dataclasses import MISSING
 
 from srb.core.asset import AssetVariant, Humanoid, MobileRobot
@@ -54,7 +55,7 @@ class MobileMarlEnvCfg(DirectMarlEnvCfg):
         map_cmd_fns = []
         
         for agent_id, robot_cfg in self.robots.items():
-            self.robot = robot_cfg
+            self.robot = copy.deepcopy(robot_cfg)
             # Call the base class method to instantiate scene elements and ActionGroup configs,
             # but specify unique prim paths per agent
             BaseEnvCfg._add_robot(
@@ -70,7 +71,7 @@ class MobileMarlEnvCfg(DirectMarlEnvCfg):
             from srb.core.manager import ActionTermCfg
             for attr_name, attr_val in self.actions.__dict__.items():
                 if isinstance(attr_val, ActionTermCfg):
-                    setattr(accumulated_actions, attr_name, attr_val)
+                    setattr(accumulated_actions, attr_name, copy.deepcopy(attr_val))
             if hasattr(self.actions, 'map_cmd_to_action'):
                 map_cmd_fns.append(self.actions.map_cmd_to_action)
         
