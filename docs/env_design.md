@@ -1,4 +1,4 @@
-# MARL Waypoint Navigation — Environment Design Document (v3 — Final)
+# MARL Waypoint Navigation — Environment Design Document (v4 — Ray Grid Configurable)
 
 ## Overview
 
@@ -50,10 +50,11 @@ R = w_progress  * mean(explorer_progress)
 
 ---
 
-## Observation Space (139 dims per agent)
+## Observation Space (67 dims per agent by default)
 
-All agents share the same 139-dimensional observation. The first 2 dims
-differ semantically: explorers see relative XY to their target; the
+All agents share the same observation layout. The default observation is
+67-dimensional: 18 non-terrain features plus 49 terrain rays. The first
+2 dims differ semantically: explorers see relative XY to their target; the
 supporter receives zeros (no target).
 
 | Component | Dims | Source | Notes |
@@ -65,8 +66,8 @@ supporter receives zeros (no target).
 | IMU linear acceleration | 3 | `ImuData.lin_acc_b` | Body frame; captures terrain forces |
 | IMU angular velocity | 3 | `ImuData.ang_vel_b` | Body frame; gyroscope reading |
 | Projected gravity | 3 | `ImuData.projected_gravity_b` | (0,0,-1) when upright; detects slope and tilt |
-| RayCaster terrain heights | 121 | `RayCasterData` | 11x11 grid, relative to sensor Z |
-| **Total** | **139** | | |
+| RayCaster terrain heights | 49 default | `RayCasterData` | 7x7 grid by default, relative to sensor Z |
+| **Total** | **67 default** | | `18 + terrain_num_rays` |
 
 ### Design Rationale
 - **Relative XY only** (no distance + heading): XY is sufficient; distance
@@ -84,7 +85,7 @@ supporter receives zeros (no target).
 
 ---
 
-## Global State (414 dims, CTDE Centralized Critic)
+## Global State (198 dims by default, CTDE Centralized Critic)
 
 All in the **env-local frame** (world-aligned, origin at `env_origin`).
 Uses ground-truth data not available to the actor.
@@ -99,10 +100,10 @@ Uses ground-truth data not available to the actor.
 | Velocity_explorer_2 | 6 | |
 | Target_explorer_1 | 3 | Position relative to env_origin |
 | Target_explorer_2 | 3 | |
-| Terrain_supporter | 121 | RayCaster heights |
-| Terrain_explorer_1 | 121 | |
-| Terrain_explorer_2 | 121 | |
-| **Total** | **414** | |
+| Terrain_supporter | 49 default | RayCaster heights |
+| Terrain_explorer_1 | 49 default | |
+| Terrain_explorer_2 | 49 default | |
+| **Total** | **198 default** | `51 + 3 * terrain_num_rays` |
 
 ### Key Differences: State vs Observation
 | Aspect | Observation (Actor) | State (Critic) |
@@ -138,7 +139,11 @@ tilted = tilt > 1.31  # ~75 degrees
 | Sensor | Config | Data Used |
 |:---|:---|:---|
 | **IMU** | `ImuCfg` on chassis, `gravity_bias=(0,0,0)` | `lin_acc_b(3)`, `ang_vel_b(3)`, `projected_gravity_b(3)` |
-| **RayCaster** | 11x11 grid, 0.15m spacing, 2.0m max, downward | Relative terrain heights (121) |
+| **RayCaster** | 7x7 grid default, 0.25m spacing, 1.5m x 1.5m footprint, 2.0m max, downward | Relative terrain heights (49 default) |
+
+RayCaster grid parameters are configurable. Changing them changes the
+observation and state dimensions, so checkpoints trained with a different
+grid are not shape-compatible.
 
 ---
 
@@ -181,6 +186,9 @@ action, or termination definitions.
 | `w_goal` | `5.0` | Per-explorer goal-reached weight |
 | `w_proximity` | `0.5` | Inter-rover proximity penalty weight |
 | `w_action` | `0.1` | Action-rate penalty weight |
+| `terrain_grid_size` | `(1.5, 1.5)` | RayCaster footprint `(length, width)` in meters |
+| `terrain_grid_resolution` | `0.25` | Ray spacing in meters; default produces 7x7 = 49 rays |
+| `raycaster_max_distance` | `2.0` | Maximum downward ray distance in meters |
 | `env_rate` | `1/50` | Physics rate (50 Hz) |
 | `agent_rate` | `1/25` | Decision rate (25 Hz, decimation=2) |
 | `debug_flat_scenery` | `False` | Debug-only option to replace procedural terrain with a flat ground plane |

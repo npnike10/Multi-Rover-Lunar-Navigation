@@ -11,16 +11,16 @@ All agents receive the **exact same scalar reward** at each timestep (Dec-POMDP)
       - w_proximity * mean(proximity_penalty over all rover pairs)
       - w_action    * mean(action_rate_penalty over all agents)
 
-Global State (414 dims, CTDE centralized critic):
+Global State (198 dims by default, CTDE centralized critic):
     [Pose_sup(9), Pose_exp1(9), Pose_exp2(9),
      Vel_sup(6),  Vel_exp1(6),  Vel_exp2(6),
      Target_exp1(3), Target_exp2(3),
-     Terrain_sup(121), Terrain_exp1(121), Terrain_exp2(121)]
+     Terrain_sup(49), Terrain_exp1(49), Terrain_exp2(49)]
 
-Local Observation (139 dims per agent, decentralized actor):
+Local Observation (67 dims by default per agent, decentralized actor):
     [task_xy(2), other_rover1_xy(2), other_rover2_xy(2),
      lin_vel_b(3), imu_lin_acc(3), imu_ang_vel(3), projected_gravity(3),
-     terrain(121)]
+     terrain(49)]
 
 Actions (2 dims per agent): [linear_velocity, angular_velocity]
 
@@ -28,6 +28,7 @@ Termination: both explorers reach targets OR any rover rolls over.
 Truncation:  time limit exceeded.
 """
 
+import math
 from typing import Sequence
 
 import torch
@@ -141,6 +142,12 @@ class MarlWaypointTaskCfg(GroundMarlEnvCfg):
         w_goal: Weight for per-explorer goal-reached bonus. Default 5.0.
         w_proximity: Weight for inter-rover proximity penalty. Default 0.5.
         w_action: Weight for action-rate smoothness penalty. Default 0.1.
+        terrain_grid_size: RayCaster grid footprint (length, width) in meters.
+            Default (1.5, 1.5).
+        terrain_grid_resolution: RayCaster grid spacing in meters. Default
+            0.25, producing a 7x7 grid over the default footprint.
+        raycaster_max_distance: Maximum downward ray distance in meters.
+            Default 2.0.
     """
 
     # -- Scene ----------------------------------------------------------------
@@ -150,6 +157,9 @@ class MarlWaypointTaskCfg(GroundMarlEnvCfg):
     from srb.core.asset import Scenery
     scenery: Scenery | AssetVariant = AssetVariant.PROCEDURAL
     debug_flat_scenery: bool = False
+    terrain_grid_size: tuple[float, float] = (1.5, 1.5)
+    terrain_grid_resolution: float = 0.25
+    raycaster_max_distance: float = 2.0
 
     # -- Rovers ---------------------------------------------------------------
     robots = {
@@ -189,13 +199,41 @@ class MarlWaypointTaskCfg(GroundMarlEnvCfg):
     observation_delay_steps: int = 0
 
     # -- Space metadata -------------------------------------------------------
-    # Obs per agent : 2 (task_xy) + 2+2 (other rovers) + 3 (vel) + 3 (acc)
-    #                 + 3 (ang_vel) + 3 (gravity) + 121 (terrain) = 139
-    # State (global): 414  (see docs/env_design.md)
+    # Obs per agent : 18 non-terrain dims + terrain_num_rays
+    # State (global): 51 non-terrain dims + num_agents * terrain_num_rays
     # Act per agent : 2    (linear + angular velocity)
     observation_spaces: dict = None  # type: ignore[assignment]
     action_spaces: dict = None       # type: ignore[assignment]
     state_space: int = 0             # set in __post_init__
+
+    @staticmethod
+    def _terrain_axis_ray_count(size: float, resolution: float) -> int:
+        """Match Isaac Lab GridPatternCfg's inclusive arange ray count."""
+        if size <= 0.0:
+            raise ValueError(f"terrain_grid_size values must be > 0. Received: {size}")
+        if resolution <= 0.0:
+            raise ValueError(
+                f"terrain_grid_resolution must be > 0. Received: {resolution}"
+            )
+        return math.floor(size / resolution + 1.0e-9) + 1
+
+    @property
+    def terrain_num_rays(self) -> int:
+        x_count = self._terrain_axis_ray_count(
+            self.terrain_grid_size[0], self.terrain_grid_resolution
+        )
+        y_count = self._terrain_axis_ray_count(
+            self.terrain_grid_size[1], self.terrain_grid_resolution
+        )
+        return x_count * y_count
+
+    @property
+    def local_observation_dim(self) -> int:
+        return 18 + self.terrain_num_rays
+
+    @property
+    def global_state_dim(self) -> int:
+        return 51 + len(self.robots) * self.terrain_num_rays
 
     def __post_init__(self):
         if self.debug_flat_scenery:
@@ -207,12 +245,11 @@ class MarlWaypointTaskCfg(GroundMarlEnvCfg):
 
         # Populate space metadata BEFORE super().__post_init__()
         agent_ids = list(self.robots.keys())
-        self.observation_spaces = {aid: 139 for aid in agent_ids}
+        self.observation_spaces = {aid: self.local_observation_dim for aid in agent_ids}
         self.action_spaces = {aid: 2 for aid in agent_ids}
         self.possible_agents = agent_ids
 
-        # Global state: 3×9 (poses) + 3×6 (vels) + 2×3 (targets) + 3×121 (terrain) = 414
-        self.state_space = 414
+        self.state_space = self.global_state_dim
 
         super().__post_init__()
 
@@ -237,7 +274,8 @@ class MarlWaypointTaskCfg(GroundMarlEnvCfg):
 
         # ---- Per-rover sensor injection ----
         for agent_id, robot_cfg in self.robots.items():
-            # RayCaster: downward-facing 11×11 grid for terrain sensing
+            # RayCaster: downward-facing terrain grid. Default is 7x7 rays
+            # over a 1.5 m x 1.5 m footprint.
             setattr(
                 self.scene,
                 f"raycaster_{agent_id}",
@@ -247,11 +285,11 @@ class MarlWaypointTaskCfg(GroundMarlEnvCfg):
                     offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 0.5)),
                     mesh_prim_paths=["/World/scenery"],
                     pattern_cfg=patterns.GridPatternCfg(
-                        resolution=0.15,
-                        size=[1.5, 1.5],
+                        resolution=self.terrain_grid_resolution,
+                        size=self.terrain_grid_size,
                         direction=(0.0, 0.0, -1.0),
                     ),
-                    max_distance=2.0,
+                    max_distance=self.raycaster_max_distance,
                     debug_vis=False,
                 ),
             )
@@ -288,8 +326,9 @@ class MarlWaypointTask(GroundMarlEnv):
 
     MDP Components
     --------------
-    * ``_get_observations``:  139-dim local obs per agent.
-    * ``_get_states``:        414-dim privileged global state for CTDE critic.
+    * ``_get_observations``:  local obs per agent (67 dims by default).
+    * ``_get_states``:        privileged global state for CTDE critic
+                              (198 dims by default).
     * ``_get_rewards``:       Single shared Dec-POMDP reward for all agents.
     * ``_get_dones``:         Terminate on joint goal-reach or rollover.
     """
@@ -464,8 +503,9 @@ class MarlWaypointTask(GroundMarlEnv):
         """Relative terrain heights from the RayCaster grid.
 
         Returns:
-            ``(num_envs, 121)`` tensor.  Negative = crater/below sensor,
-            positive = hill/above sensor.  NaN/inf → ``-2.0``.
+            ``(num_envs, terrain_num_rays)`` tensor. Negative means
+            crater/below sensor, positive means hill/above sensor. NaN/inf
+            values are replaced with ``-2.0``.
         """
         rc = self._raycasters[agent_id]
         sensor_z = rc.data.pos_w[:, 2:3]
@@ -474,11 +514,11 @@ class MarlWaypointTask(GroundMarlEnv):
         return torch.nan_to_num(heights, nan=-2.0, posinf=-2.0, neginf=-2.0)
 
     # --------------------------------------------------------------------- #
-    #  Observations  (per-agent, decentralized — 139 dims)                    #
+    #  Observations  (per-agent, decentralized)                               #
     # --------------------------------------------------------------------- #
 
     def _get_observations(self) -> dict[str, torch.Tensor]:
-        """Build 139-dim local observation for each agent.
+        """Build local observations for each agent.
 
         Layout::
 
@@ -489,7 +529,7 @@ class MarlWaypointTask(GroundMarlEnv):
             imu_lin_acc_b       (3)  — IMU linear acceleration (body frame)
             imu_ang_vel_b       (3)  — IMU angular velocity (body frame)
             projected_gravity_b (3)  — gravity direction in body frame
-            terrain             (121) — RayCaster relative heights
+            terrain             (terrain_num_rays) — RayCaster relative heights
         """
         obs = {}
 
@@ -551,19 +591,19 @@ class MarlWaypointTask(GroundMarlEnv):
             parts.append(imu.data.ang_vel_b)             # (N, 3) angular velocity
             parts.append(imu.data.projected_gravity_b)   # (N, 3) gravity direction
 
-            # ---- Terrain features (121 dims) ----
+            # ---- Terrain features ----
             parts.append(self._get_terrain_features(aid))
 
-            obs[aid] = torch.cat(parts, dim=-1)  # (N, 139)
+            obs[aid] = torch.cat(parts, dim=-1)
 
         return obs
 
     # --------------------------------------------------------------------- #
-    #  Global State  (CTDE centralized critic — 414 dims)                     #
+    #  Global State  (CTDE centralized critic)                                #
     # --------------------------------------------------------------------- #
 
     def _get_states(self) -> torch.Tensor:
-        """Build the 414-dim privileged global state vector.
+        """Build the privileged global state vector.
 
         Layout (all in env-local frame, orientations as 6D continuous rep)::
 
@@ -575,11 +615,9 @@ class MarlWaypointTask(GroundMarlEnv):
             Vel_explorer_2   (6)
             Target_explorer_1(3)  = position relative to env_origin
             Target_explorer_2(3)
-            Terrain_supporter  (121)  = RayCaster relative heights
-            Terrain_explorer_1 (121)
-            Terrain_explorer_2 (121)
-            ─────────────────────────
-            Total              414
+            Terrain_supporter  (terrain_num_rays)  = RayCaster relative heights
+            Terrain_explorer_1 (terrain_num_rays)
+            Terrain_explorer_2 (terrain_num_rays)
         """
         parts = []
 
@@ -601,11 +639,11 @@ class MarlWaypointTask(GroundMarlEnv):
         for aid in self.cfg.explorer_agents:
             parts.append(self._goals[aid] - self.scene.env_origins)  # (N, 3)
 
-        # -- Terrain features (121 rays per rover) --
+        # -- Terrain features --
         for aid in self.cfg.possible_agents:
-            parts.append(self._get_terrain_features(aid))  # (N, 121)
+            parts.append(self._get_terrain_features(aid))
 
-        return torch.cat(parts, dim=-1)  # (N, 414)
+        return torch.cat(parts, dim=-1)
 
     # --------------------------------------------------------------------- #
     #  Rewards  (Dec-POMDP: single shared reward for all agents)              #

@@ -27,13 +27,14 @@ models:
 # https://skrl.readthedocs.io/en/latest/api/memories/random.html
 memory:
   class: RandomMemory
-  memory_size: 256  # Defines the rollout length before a PPO update
+  # skrl MAPPO samples the full memory buffer on update, so keep this in sync
+  # with agent.rollouts to avoid training on stale or uncollected rows.
+  memory_size: 64
 
 # https://skrl.readthedocs.io/en/latest/api/agents/mappo.html
 agent:
   class: MAPPO
-  # Removing hyperparameter overrides (learning_rate, rollouts, mini_batches, etc.) 
-  # so that SKRL falls back to its MAPPO_DEFAULT_CONFIG.
+  rollouts: 64
   
   # Standardizing states and values is common for MAPPO
   state_preprocessor: RunningStandardScaler
