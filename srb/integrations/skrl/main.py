@@ -75,9 +75,13 @@ def _install_native_wandb_scalar_logging() -> None:
     def _wandb_enabled(agent: Any) -> bool:
         return bool(agent.cfg.get("experiment", {}).get("wandb", False))
 
-    def _wandb_tensorboard_sync_enabled(agent: Any) -> bool:
-        wandb_kwargs = agent.cfg.get("experiment", {}).get("wandb_kwargs", {})
-        return bool(wandb_kwargs.get("sync_tensorboard", False))
+    def _ensure_global_step_axis(wandb: Any) -> None:
+        run = getattr(wandb, "run", None)
+        if run is None or getattr(run, "_srb_global_step_axis_defined", False):
+            return
+        wandb.define_metric("global_step")
+        wandb.define_metric("*", step_metric="global_step")
+        setattr(run, "_srb_global_step_axis_defined", True)
 
     def _flush_writer(agent: Any) -> None:
         writer = getattr(agent, "writer", None)
@@ -91,10 +95,7 @@ def _install_native_wandb_scalar_logging() -> None:
             return
 
         def write_tracking_data(self: Any, timestep: int, timesteps: int) -> None:
-            use_native_wandb = _wandb_enabled(
-                self
-            ) and not _wandb_tensorboard_sync_enabled(self)
-            payload = _tracking_payload(self) if use_native_wandb else {}
+            payload = _tracking_payload(self) if _wandb_enabled(self) else {}
             original(self, timestep, timesteps)
             _flush_writer(self)
             if not payload:
@@ -104,6 +105,8 @@ def _install_native_wandb_scalar_logging() -> None:
                 import wandb
 
                 if wandb.run is not None:
+                    _ensure_global_step_axis(wandb)
+                    payload["global_step"] = int(timestep)
                     wandb.log(payload, step=timestep, commit=True)
             except Exception as exc:
                 logging.warning(f"Failed to log skrl metrics to WandB: {exc}")
@@ -159,10 +162,9 @@ def run(
     agent_cfg["agent"]["experiment"]["experiment_name"] = logdir
     if agent_cfg["agent"]["experiment"].get("wandb", False):
         wandb_kwargs = agent_cfg["agent"]["experiment"].setdefault("wandb_kwargs", {})
-        # Keep skrl's normal TensorBoard-to-WandB integration enabled. The
-        # native scalar mirror above is a fallback, but TensorBoard sync is the
-        # path that produces the usual WandB charts from skrl's SummaryWriter.
-        wandb_kwargs["sync_tensorboard"] = True
+        # Use native W&B logging so the run step is the skrl environment
+        # timestep, not W&B's TensorBoard-sync row counter.
+        wandb_kwargs["sync_tensorboard"] = False
 
     unwrapped_env = getattr(env, "unwrapped", env)
     is_multi_agent = hasattr(unwrapped_env, "possible_agents")
