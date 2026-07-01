@@ -72,18 +72,24 @@ def _install_native_wandb_scalar_logging() -> None:
             payload[key] = float(value)
         return payload
 
+    def _wandb_enabled(agent: Any) -> bool:
+        return bool(agent.cfg.get("experiment", {}).get("wandb", False))
+
+    def _flush_writer(agent: Any) -> None:
+        writer = getattr(agent, "writer", None)
+        flush = getattr(writer, "flush", None)
+        if callable(flush):
+            flush()
+
     def _wrap_write_tracking_data(cls: type) -> None:
         original = getattr(cls, "write_tracking_data")
         if getattr(original, "_srb_wandb_wrapped", False):
             return
 
         def write_tracking_data(self: Any, timestep: int, timesteps: int) -> None:
-            payload = (
-                _tracking_payload(self)
-                if self.cfg.get("experiment", {}).get("wandb", False)
-                else {}
-            )
+            payload = _tracking_payload(self) if _wandb_enabled(self) else {}
             original(self, timestep, timesteps)
+            _flush_writer(self)
             if not payload:
                 return
 
@@ -91,7 +97,7 @@ def _install_native_wandb_scalar_logging() -> None:
                 import wandb
 
                 if wandb.run is not None:
-                    wandb.log(payload, step=timestep)
+                    wandb.log(payload, step=timestep, commit=True)
             except Exception as exc:
                 logging.warning(f"Failed to log skrl metrics to WandB: {exc}")
 
@@ -146,7 +152,10 @@ def run(
     agent_cfg["agent"]["experiment"]["experiment_name"] = logdir
     if agent_cfg["agent"]["experiment"].get("wandb", False):
         wandb_kwargs = agent_cfg["agent"]["experiment"].setdefault("wandb_kwargs", {})
-        wandb_kwargs.setdefault("sync_tensorboard", False)
+        # Keep skrl's normal TensorBoard-to-WandB integration enabled. The
+        # native scalar mirror above is a fallback, but TensorBoard sync is the
+        # path that produces the usual WandB charts from skrl's SummaryWriter.
+        wandb_kwargs["sync_tensorboard"] = True
 
     unwrapped_env = getattr(env, "unwrapped", env)
     is_multi_agent = hasattr(unwrapped_env, "possible_agents")
