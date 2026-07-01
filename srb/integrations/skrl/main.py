@@ -75,6 +75,10 @@ def _install_native_wandb_scalar_logging() -> None:
     def _wandb_enabled(agent: Any) -> bool:
         return bool(agent.cfg.get("experiment", {}).get("wandb", False))
 
+    def _wandb_tensorboard_sync_enabled(agent: Any) -> bool:
+        wandb_kwargs = agent.cfg.get("experiment", {}).get("wandb_kwargs", {})
+        return bool(wandb_kwargs.get("sync_tensorboard", False))
+
     def _flush_writer(agent: Any) -> None:
         writer = getattr(agent, "writer", None)
         flush = getattr(writer, "flush", None)
@@ -87,7 +91,10 @@ def _install_native_wandb_scalar_logging() -> None:
             return
 
         def write_tracking_data(self: Any, timestep: int, timesteps: int) -> None:
-            payload = _tracking_payload(self) if _wandb_enabled(self) else {}
+            use_native_wandb = _wandb_enabled(
+                self
+            ) and not _wandb_tensorboard_sync_enabled(self)
+            payload = _tracking_payload(self) if use_native_wandb else {}
             original(self, timestep, timesteps)
             _flush_writer(self)
             if not payload:
