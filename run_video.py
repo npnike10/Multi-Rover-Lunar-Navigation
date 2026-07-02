@@ -1,4 +1,5 @@
 from srb.core.app import AppLauncher
+
 launcher = AppLauncher(enable_cameras=True)
 app = launcher.app
 
@@ -28,12 +29,18 @@ NUM_STEPS = 500
 
 # Drastically different directions so rovers spread apart and never clash:
 #   supporter  → hard left arc
-#   explorer_1 → hard right arc  
+#   explorer_1 → hard right arc
 #   explorer_2 → straight backward
 fixed_actions = {
-    "supporter":  torch.tensor([[ 0.9, -1.0]], dtype=torch.float32, device=env.unwrapped.device),
-    "explorer_1": torch.tensor([[ 0.9,  1.0]], dtype=torch.float32, device=env.unwrapped.device),
-    "explorer_2": torch.tensor([[-0.9,  0.0]], dtype=torch.float32, device=env.unwrapped.device),
+    "supporter": torch.tensor(
+        [[1, 0.0]], dtype=torch.float32, device=env.unwrapped.device
+    ),
+    "explorer_1": torch.tensor(
+        [[1, 0.0]], dtype=torch.float32, device=env.unwrapped.device
+    ),
+    "explorer_2": torch.tensor(
+        [[-1, 0.0]], dtype=torch.float32, device=env.unwrapped.device
+    ),
 }
 
 
@@ -70,7 +77,7 @@ for i in range(NUM_STEPS):
 
 output_path = "/home/niket/Documents/TRG/MRLN/marl_navigation.mp4"
 print(f"Saving MP4 ({len(frames)} frames) to {output_path}...")
-writer = imageio.get_writer(output_path, fps=20, codec='libx264', quality=8)
+writer = imageio.get_writer(output_path, fps=20, codec="libx264", quality=8)
 for frame in frames:
     writer.append_data(frame)
 writer.close()

@@ -55,13 +55,13 @@ from isaaclab.sensors.ray_caster import RayCasterCfg, patterns
 from srb.utils.cfg import configclass
 from srb.utils.math import matrix_from_quat, subtract_frame_transforms, quat_to_rot6d
 
-
 ###############################################################################
 # Scene Configuration
 ###############################################################################
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import RigidObjectCfg
+
 
 @configclass
 class MarlWaypointSceneCfg(GroundMarlSceneCfg):
@@ -77,13 +77,12 @@ class MarlWaypointSceneCfg(GroundMarlSceneCfg):
             ),
             collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=False),
             visual_material=PreviewSurfaceCfg(
-                diffuse_color=(0.0, 0.0, 1.0),
-                emissive_color=(0.0, 0.0, 1.0)
+                diffuse_color=(0.0, 0.0, 1.0), emissive_color=(0.0, 0.0, 1.0)
             ),
         ),
         init_state=RigidObjectCfg.InitialStateCfg(pos=(0.0, 0.0, 5.0)),
     )
-    
+
     target_2: RigidObjectCfg = RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/target_2",
         spawn=sim_utils.ConeCfg(
@@ -96,12 +95,12 @@ class MarlWaypointSceneCfg(GroundMarlSceneCfg):
             ),
             collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=False),
             visual_material=PreviewSurfaceCfg(
-                diffuse_color=(0.0, 1.0, 0.0),
-                emissive_color=(0.0, 1.0, 0.0)
+                diffuse_color=(0.0, 1.0, 0.0), emissive_color=(0.0, 1.0, 0.0)
             ),
         ),
         init_state=RigidObjectCfg.InitialStateCfg(pos=(0.0, 0.0, 5.0)),
     )
+
 
 ###############################################################################
 # Configuration
@@ -110,8 +109,6 @@ class MarlWaypointSceneCfg(GroundMarlSceneCfg):
 
 @configclass
 class MarlWaypointTaskCfg(GroundMarlEnvCfg):
-    
-
     """Configuration for the MARL Waypoint Navigation environment.
 
     Dec-POMDP with 3 lunar rovers (1 supporter + 2 explorers) on procedurally
@@ -155,6 +152,7 @@ class MarlWaypointTaskCfg(GroundMarlEnvCfg):
 
     # -- Terrain --------------------------------------------------------------
     from srb.core.asset import Scenery
+
     scenery: Scenery | AssetVariant = AssetVariant.PROCEDURAL
     debug_flat_scenery: bool = False
     terrain_grid_size: tuple[float, float] = (1.5, 1.5)
@@ -172,27 +170,31 @@ class MarlWaypointTaskCfg(GroundMarlEnvCfg):
     explorer_agents: list = ["explorer_1", "explorer_2"]
     supporter_agent: str = "supporter"
 
-
     # -- Episode --------------------------------------------------------------
     episode_length_s: float = 60.0
     is_finite_horizon: bool = False
 
     # -- Goal parameters ------------------------------------------------------
-    goal_reached_threshold: float = 0.5   # meters
-    target_spawn_radius: float = 5.0      # max meters from env origin
+    goal_reached_threshold: float = 0.5  # meters
+    target_spawn_radius: float = 5.0  # max meters from env origin
     target_spawn_min_radius: float = 2.0  # min meters from env origin
-    target_min_separation: float = 3.0    # min meters between the two targets
+    target_min_separation: float = 3.0  # min meters between the two targets
 
     # -- Safety parameters ----------------------------------------------------
-    safe_distance: float | None = None    # None = auto (longest rover length)
+    safe_distance: float | None = None  # None = auto (longest rover length)
     rollover_threshold_rad: float = 1.31  # ~75 degrees
-    rollover_debounce_steps: int = 5      # 0.2s at 25 Hz
+    rollover_debounce_steps: int = 5  # 0.2s at 25 Hz
 
     # -- Dec-POMDP reward weights (single shared reward) ----------------------
-    w_progress: float = 1.0    # mean explorer progress
-    w_goal: float = 5.0        # per-explorer goal-reached bonus
-    w_proximity: float = 0.5   # inter-rover proximity penalty
-    w_action: float = 0.1      # action-rate smoothness penalty
+    w_progress: float = 1.0  # mean explorer progress
+    w_goal: float = 5.0  # per-explorer goal-reached bonus
+    w_proximity: float = 5  # inter-rover proximity penalty
+    w_action: float = 0.1  # action-rate smoothness penalty
+    debug_metrics: bool = True
+    live_reward_debug: bool = False
+    live_reward_debug_interval: int = 25
+    live_action_debug: bool = False
+    live_action_debug_interval: int = 25
 
     # -- Delays ---------------------------------------------------------------
     action_delay_steps: int = 0
@@ -203,8 +205,8 @@ class MarlWaypointTaskCfg(GroundMarlEnvCfg):
     # State (global): 51 non-terrain dims + num_agents * terrain_num_rays
     # Act per agent : 2    (linear + angular velocity)
     observation_spaces: dict = None  # type: ignore[assignment]
-    action_spaces: dict = None       # type: ignore[assignment]
-    state_space: int = 0             # set in __post_init__
+    action_spaces: dict = None  # type: ignore[assignment]
+    state_space: int = 0  # set in __post_init__
 
     @staticmethod
     def _terrain_axis_ray_count(size: float, resolution: float) -> int:
@@ -338,8 +340,11 @@ class MarlWaypointTask(GroundMarlEnv):
     def __init__(self, cfg: MarlWaypointTaskCfg, **kwargs):
         super().__init__(cfg, **kwargs)
 
-
         self.action_manager = ActionManager(self.cfg.actions, env=self)
+        self._wheeled_drive_terms = {
+            aid: self.action_manager._terms.get(f"robot_{aid}/wheeled_drive")
+            for aid in self.cfg.possible_agents
+        }
 
         # -- Per-agent action buffers (for action-rate penalty) --
         self._actions_dict = {
@@ -353,8 +358,7 @@ class MarlWaypointTask(GroundMarlEnv):
 
         # -- RayCaster handles --
         self._raycasters = {
-            aid: self.scene[f"raycaster_{aid}"]
-            for aid in self.cfg.possible_agents
+            aid: self.scene[f"raycaster_{aid}"] for aid in self.cfg.possible_agents
         }
 
         # -- IMU handles --
@@ -363,8 +367,7 @@ class MarlWaypointTask(GroundMarlEnv):
         # We ensure they exist here as well.
         if not self._imus:
             self._imus = {
-                aid: self.scene[f"imu_{aid}"]
-                for aid in self.cfg.possible_agents
+                aid: self.scene[f"imu_{aid}"] for aid in self.cfg.possible_agents
             }
 
         # -- Goal buffers (explorers only — supporter has no waypoint) --
@@ -378,6 +381,14 @@ class MarlWaypointTask(GroundMarlEnv):
         # -- Per-explorer "reached" flag --
         self._explorer_reached = {
             aid: torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+            for aid in self.cfg.explorer_agents
+        }
+        self._prev_goal_distances = {
+            aid: torch.zeros(self.num_envs, device=self.device)
+            for aid in self.cfg.explorer_agents
+        }
+        self._last_goal_distances = {
+            aid: torch.zeros(self.num_envs, device=self.device)
             for aid in self.cfg.explorer_agents
         }
 
@@ -397,18 +408,22 @@ class MarlWaypointTask(GroundMarlEnv):
             max_extent = 0.0
             for aid in self.cfg.possible_agents:
                 robot = self._robots[aid]
-                body_pos = robot.data.body_pos_w[0]   # (num_bodies, 3)
-                root_pos = robot.data.root_pos_w[0]   # (3,)
+                body_pos = robot.data.body_pos_w[0]  # (num_bodies, 3)
+                root_pos = robot.data.root_pos_w[0]  # (3,)
                 extents = torch.norm(body_pos - root_pos, dim=-1)
                 max_extent = max(max_extent, extents.max().item() * 2.0)
             self._safe_distance = max_extent
-            print(f"[MarlWaypointTask] Auto safe_distance = {self._safe_distance:.3f} m")
+            print(
+                f"[MarlWaypointTask] Auto safe_distance = {self._safe_distance:.3f} m"
+            )
 
         # -- Ordered list of "other agents" per agent (for inter-rover obs) --
         self._other_agents = {
             aid: [a for a in self.cfg.possible_agents if a != aid]
             for aid in self.cfg.possible_agents
         }
+        self._debug_action_metrics: dict[str, torch.Tensor] = {}
+        self._debug_termination_metrics: dict[str, torch.Tensor] = {}
 
     # --------------------------------------------------------------------- #
     #  Reset                                                                  #
@@ -438,7 +453,7 @@ class MarlWaypointTask(GroundMarlEnv):
 
         n = len(env_ids)
         origins = self.scene.env_origins[env_ids]  # (n, 3)
-        explorer_ids = self.cfg.explorer_agents     # ["explorer_1", "explorer_2"]
+        explorer_ids = self.cfg.explorer_agents  # ["explorer_1", "explorer_2"]
 
         # -- Reset explorer targets with min separation constraint --
         # Sample target 1
@@ -461,13 +476,15 @@ class MarlWaypointTask(GroundMarlEnv):
             self._goals[aid][env_ids, 0] = origins[:, 0] + xy[:, 0]
             self._goals[aid][env_ids, 1] = origins[:, 1] + xy[:, 1]
             self._goals[aid][env_ids, 2] = origins[:, 2]  # ground level
-            
+
             # Update visual target poses in simulation
             target_obj = self.scene[f"target_{i+1}"]
             target_pose = torch.zeros((len(env_ids), 7), device=self.device)
             target_pose[:, :3] = self._goals[aid][env_ids]
             target_pose[:, 2] += 1.5  # Hover 1.5m above ground
-            target_pose[:, 3:7] = torch.tensor([0.0, 0.0, 1.0, 0.0], device=self.device) # Rotate 180 deg (point down)
+            target_pose[:, 3:7] = torch.tensor(
+                [0.0, 0.0, 1.0, 0.0], device=self.device
+            )  # Rotate 180 deg (point down)
             target_obj.write_root_pose_to_sim(target_pose, env_ids=env_ids)
 
         # -- Reset flags and buffers --
@@ -477,6 +494,11 @@ class MarlWaypointTask(GroundMarlEnv):
             self._actions_dict[aid][env_ids] = 0.0
             self._prev_actions_dict[aid][env_ids] = 0.0
             self._rollover_count[aid][env_ids] = 0
+        for aid in self.cfg.explorer_agents:
+            pos_w = self._robots[aid].data.root_link_pose_w[env_ids, :3]
+            dist2d = torch.norm(pos_w[:, :2] - self._goals[aid][env_ids, :2], dim=-1)
+            self._prev_goal_distances[aid][env_ids] = dist2d
+            self._last_goal_distances[aid][env_ids] = dist2d
 
     # --------------------------------------------------------------------- #
     #  Actions                                                                #
@@ -491,9 +513,69 @@ class MarlWaypointTask(GroundMarlEnv):
             flat_parts.append(act)
 
         self.action_manager.process_action(torch.cat(flat_parts, dim=-1))
+        self._update_action_debug_metrics()
+
+        if self.cfg.live_action_debug:
+            interval = max(1, int(self.cfg.live_action_debug_interval))
+            step = int(getattr(self, "common_step_counter", 0))
+            if step % interval == 0 and self.num_envs > 0:
+                env_idx = 0
+                print(
+                    f"[actions step={step} env={env_idx}] "
+                    f"{self._action_debug_payload(env_idx)}",
+                    flush=True,
+                )
 
     def _apply_action(self) -> None:
         self.action_manager.apply_action()
+
+    def _action_debug_payload(self, env_idx: int = 0) -> dict[str, dict[str, float]]:
+        payload = {}
+        for aid in self.cfg.possible_agents:
+            action = self._actions_dict[aid][env_idx]
+            entry = {
+                "raw_linear_velocity": float(action[0].item()),
+                "raw_angular_velocity": float(action[1].item()),
+            }
+            term = self._wheeled_drive_terms.get(aid)
+            processed_actions = getattr(term, "processed_actions", None)
+            if processed_actions is not None:
+                processed = processed_actions[env_idx]
+                entry["processed_linear_velocity"] = float(processed[0].item())
+                entry["processed_angular_velocity"] = float(processed[1].item())
+            payload[aid] = entry
+        return payload
+
+    def _update_action_debug_metrics(self) -> None:
+        if not self.cfg.debug_metrics:
+            self._debug_action_metrics = {}
+            return
+
+        metrics = {}
+        for aid in self.cfg.possible_agents:
+            action = self._actions_dict[aid]
+            action_delta = action - self._prev_actions_dict[aid]
+            metrics[f"Debug / Action raw linear mean / {aid}"] = action[:, 0].mean()
+            metrics[f"Debug / Action raw angular mean / {aid}"] = action[:, 1].mean()
+            metrics[f"Debug / Action raw abs mean / {aid}"] = action.abs().mean()
+            metrics[f"Debug / Action rate mean / {aid}"] = (
+                action_delta.square().mean(dim=-1).mean()
+            )
+
+            term = self._wheeled_drive_terms.get(aid)
+            processed_actions = getattr(term, "processed_actions", None)
+            if processed_actions is not None:
+                metrics[f"Debug / Command linear mean / {aid}"] = processed_actions[
+                    :, 0
+                ].mean()
+                metrics[f"Debug / Command angular mean / {aid}"] = processed_actions[
+                    :, 1
+                ].mean()
+                metrics[f"Debug / Command abs mean / {aid}"] = (
+                    processed_actions.abs().mean()
+                )
+
+        self._debug_action_metrics = metrics
 
     # --------------------------------------------------------------------- #
     #  Terrain helper (shared by observations and state)                      #
@@ -549,7 +631,7 @@ class MarlWaypointTask(GroundMarlEnv):
 
         for aid in self.cfg.possible_agents:
             robot = self._robots[aid]
-            pose = robot.data.root_link_pose_w           # (N, 7)
+            pose = robot.data.root_link_pose_w  # (N, 7)
             ego_pos = pose[:, :3]
             ego_quat = pose[:, 3:7]
             imu = self._imus[aid]
@@ -561,8 +643,10 @@ class MarlWaypointTask(GroundMarlEnv):
                 # Explorer: relative XY to own target in body frame
                 goal = self._goals[aid]
                 tf_pos, _ = subtract_frame_transforms(
-                    t01=ego_pos, q01=ego_quat,
-                    t02=goal, q02=id_quat,
+                    t01=ego_pos,
+                    q01=ego_quat,
+                    t02=goal,
+                    q02=id_quat,
                 )
                 parts.append(tf_pos[:, :2])  # (N, 2)
                 # Collect markers
@@ -576,20 +660,22 @@ class MarlWaypointTask(GroundMarlEnv):
             for other_aid in self._other_agents[aid]:
                 other_pos = all_pos_w[other_aid]
                 tf_pos, _ = subtract_frame_transforms(
-                    t01=ego_pos, q01=ego_quat,
-                    t02=other_pos, q02=id_quat,
+                    t01=ego_pos,
+                    q01=ego_quat,
+                    t02=other_pos,
+                    q02=id_quat,
                 )
                 parts.append(tf_pos[:, :2])  # (N, 2)
 
             # ---- Body-frame linear velocity (3 dims) ----
             # In deployment: estimated via sensor fusion (wheel odometry + IMU).
             # In simulation: ground-truth from physics, following SRB convention.
-            parts.append(robot.data.root_lin_vel_b)     # (N, 3)
+            parts.append(robot.data.root_lin_vel_b)  # (N, 3)
 
             # ---- IMU readings (3 + 3 + 3 = 9 dims) ----
-            parts.append(imu.data.lin_acc_b)             # (N, 3) linear acceleration
-            parts.append(imu.data.ang_vel_b)             # (N, 3) angular velocity
-            parts.append(imu.data.projected_gravity_b)   # (N, 3) gravity direction
+            parts.append(imu.data.lin_acc_b)  # (N, 3) linear acceleration
+            parts.append(imu.data.ang_vel_b)  # (N, 3) angular velocity
+            parts.append(imu.data.projected_gravity_b)  # (N, 3) gravity direction
 
             # ---- Terrain features ----
             parts.append(self._get_terrain_features(aid))
@@ -627,13 +713,13 @@ class MarlWaypointTask(GroundMarlEnv):
             pos_w = robot.data.root_link_pose_w[:, :3]
             quat_w = robot.data.root_link_pose_w[:, 3:7]
             parts.append(pos_w - self.scene.env_origins)  # (N, 3)
-            parts.append(quat_to_rot6d(quat_w))           # (N, 6)
+            parts.append(quat_to_rot6d(quat_w))  # (N, 6)
 
         # -- Velocities: linear (3) + angular (3) = 6 per rover, world frame --
         for aid in self.cfg.possible_agents:
             robot = self._robots[aid]
-            parts.append(robot.data.root_lin_vel_w)        # (N, 3)
-            parts.append(robot.data.root_ang_vel_w)        # (N, 3)
+            parts.append(robot.data.root_lin_vel_w)  # (N, 3)
+            parts.append(robot.data.root_ang_vel_w)  # (N, 3)
 
         # -- Explorer target positions, relative to env origin --
         for aid in self.cfg.explorer_agents:
@@ -661,14 +747,22 @@ class MarlWaypointTask(GroundMarlEnv):
         """
         # ---- Explorer progress ----
         progress_terms = []
+        distance_terms = {}
+        distance_delta_terms = {}
         for aid in self.cfg.explorer_agents:
             pos_w = self._robots[aid].data.root_link_pose_w[:, :3]
             dist2d = torch.norm(pos_w[:, :2] - self._goals[aid][:, :2], dim=-1)
+            distance_terms[aid] = dist2d
+            distance_delta_terms[aid] = self._prev_goal_distances[aid] - dist2d
             progress_terms.append(1.0 / (1.0 + dist2d))
             # Update reached flags
             self._explorer_reached[aid] = dist2d < self.cfg.goal_reached_threshold
+            self._last_goal_distances[aid] = dist2d
 
         mean_progress = torch.stack(progress_terms, dim=-1).mean(dim=-1)  # (N,)
+        mean_distance_delta = torch.stack(
+            [distance_delta_terms[aid] for aid in self.cfg.explorer_agents], dim=-1
+        ).mean(dim=-1)
 
         # ---- Goal-reached bonus (per explorer, averaged) ----
         reached_count = torch.zeros(self.num_envs, device=self.device)
@@ -691,9 +785,12 @@ class MarlWaypointTask(GroundMarlEnv):
 
         # ---- Action-rate penalty (all agents, averaged) ----
         action_rates = []
+        action_rate_terms = {}
         for aid in self.cfg.possible_agents:
             diff = (self._actions_dict[aid] - self._prev_actions_dict[aid]).square()
-            action_rates.append(diff.mean(dim=-1))
+            action_rate = diff.mean(dim=-1)
+            action_rate_terms[aid] = action_rate
+            action_rates.append(action_rate)
         mean_action_rate = torch.stack(action_rates, dim=-1).mean(dim=-1)  # (N,)
 
         # ---- Shared reward ----
@@ -704,8 +801,117 @@ class MarlWaypointTask(GroundMarlEnv):
             - self.cfg.w_action * mean_action_rate
         )
 
+        self._update_episode_debug_metrics(
+            distance_terms=distance_terms,
+            distance_delta_terms=distance_delta_terms,
+            action_rate_terms=action_rate_terms,
+            mean_progress=mean_progress,
+            mean_distance_delta=mean_distance_delta,
+            goal_bonus=goal_bonus,
+            mean_proximity=mean_proximity,
+            mean_action_rate=mean_action_rate,
+            shared_reward=shared_reward,
+        )
+
+        if self.cfg.live_reward_debug:
+            interval = max(1, int(self.cfg.live_reward_debug_interval))
+            step = int(getattr(self, "common_step_counter", 0))
+            if step % interval == 0 and self.num_envs > 0:
+                env_idx = 0
+                progress = self.cfg.w_progress * mean_progress[env_idx]
+                goal = self.cfg.w_goal * goal_bonus[env_idx]
+                proximity = -self.cfg.w_proximity * mean_proximity[env_idx]
+                action = -self.cfg.w_action * mean_action_rate[env_idx]
+                reached = {
+                    aid: bool(self._explorer_reached[aid][env_idx].item())
+                    for aid in self.cfg.explorer_agents
+                }
+                print(
+                    "[reward "
+                    f"step={step} env={env_idx}] "
+                    f"total={shared_reward[env_idx].item():+.4f} "
+                    f"progress={progress.item():+.4f} "
+                    f"goal={goal.item():+.4f} "
+                    f"proximity={proximity.item():+.4f} "
+                    f"action={action.item():+.4f} "
+                    f"reached={reached}",
+                    flush=True,
+                )
+
         # Dec-POMDP: every agent gets the same reward
+        for aid in self.cfg.explorer_agents:
+            self._prev_goal_distances[aid] = distance_terms[aid]
+
         return {aid: shared_reward for aid in self.cfg.possible_agents}
+
+    def _update_episode_debug_metrics(
+        self,
+        *,
+        distance_terms: dict[str, torch.Tensor],
+        distance_delta_terms: dict[str, torch.Tensor],
+        action_rate_terms: dict[str, torch.Tensor],
+        mean_progress: torch.Tensor,
+        mean_distance_delta: torch.Tensor,
+        goal_bonus: torch.Tensor,
+        mean_proximity: torch.Tensor,
+        mean_action_rate: torch.Tensor,
+        shared_reward: torch.Tensor,
+    ) -> None:
+        if not self.cfg.debug_metrics:
+            self.extras.pop("episode", None)
+            return
+
+        metrics = {
+            **self._debug_action_metrics,
+            **self._debug_termination_metrics,
+            "Debug / Goal distance mean / explorers": torch.stack(
+                [distance_terms[aid] for aid in self.cfg.explorer_agents], dim=-1
+            ).mean(),
+            "Debug / Goal delta distance mean / explorers": mean_distance_delta.mean(),
+            "Debug / Goal reached rate / explorers": goal_bonus.mean(),
+            "RewardComponents / progress raw mean": mean_progress.mean(),
+            "RewardComponents / progress weighted mean": (
+                self.cfg.w_progress * mean_progress
+            ).mean(),
+            "RewardComponents / goal raw mean": goal_bonus.mean(),
+            "RewardComponents / goal weighted mean": (
+                self.cfg.w_goal * goal_bonus
+            ).mean(),
+            "RewardComponents / proximity raw mean": mean_proximity.mean(),
+            "RewardComponents / proximity weighted mean": (
+                -self.cfg.w_proximity * mean_proximity
+            ).mean(),
+            "RewardComponents / action raw mean": mean_action_rate.mean(),
+            "RewardComponents / action weighted mean": (
+                -self.cfg.w_action * mean_action_rate
+            ).mean(),
+            "RewardComponents / shared reward mean": shared_reward.mean(),
+            "Episode / active length mean": self.episode_length_buf.float().mean(),
+        }
+
+        for aid in self.cfg.possible_agents:
+            robot = self._robots[aid]
+            speed_xy = torch.norm(robot.data.root_lin_vel_b[:, :2], dim=-1)
+            metrics[f"Debug / Speed xy mean / {aid}"] = speed_xy.mean()
+            metrics[f"Debug / Speed xy max / {aid}"] = speed_xy.max()
+            metrics[f"Debug / Action rate reward source / {aid}"] = action_rate_terms[
+                aid
+            ].mean()
+
+        for aid in self.cfg.explorer_agents:
+            metrics[f"Debug / Goal distance mean / {aid}"] = distance_terms[aid].mean()
+            metrics[f"Debug / Goal distance min / {aid}"] = distance_terms[aid].min()
+            metrics[f"Debug / Goal delta distance mean / {aid}"] = distance_delta_terms[
+                aid
+            ].mean()
+            metrics[f"Debug / Goal reached rate / {aid}"] = (
+                self._explorer_reached[aid].float().mean()
+            )
+
+        self.extras["episode"] = {
+            key: value.detach() if isinstance(value, torch.Tensor) else value
+            for key, value in metrics.items()
+        }
 
     # --------------------------------------------------------------------- #
     #  Termination / Truncation                                               #
@@ -720,14 +926,18 @@ class MarlWaypointTask(GroundMarlEnv):
         """
         # ---- Success: both explorers reached their targets ----
         both_reached = torch.ones(
-            self.num_envs, dtype=torch.bool, device=self.device,
+            self.num_envs,
+            dtype=torch.bool,
+            device=self.device,
         )
         for aid in self.cfg.explorer_agents:
             both_reached &= self._explorer_reached[aid]
 
         # ---- Rollover: any rover tilted beyond threshold ----
         any_rolled = torch.zeros(
-            self.num_envs, dtype=torch.bool, device=self.device,
+            self.num_envs,
+            dtype=torch.bool,
+            device=self.device,
         )
         for aid in self.cfg.possible_agents:
             imu = self._imus[aid]
@@ -744,9 +954,7 @@ class MarlWaypointTask(GroundMarlEnv):
                 self._rollover_count[aid] + 1,
                 torch.zeros_like(self._rollover_count[aid]),
             )
-            any_rolled |= (
-                self._rollover_count[aid] >= self.cfg.rollover_debounce_steps
-            )
+            any_rolled |= self._rollover_count[aid] >= self.cfg.rollover_debounce_steps
 
         # Combined termination
         terminated = both_reached | any_rolled
@@ -756,8 +964,22 @@ class MarlWaypointTask(GroundMarlEnv):
 
         # Time-based truncation (only if not already terminated)
         time_out = self.episode_length_buf >= self.max_episode_length
-        truncation = {
-            aid: time_out & ~terminated for aid in self.cfg.possible_agents
+        time_out_not_terminated = time_out & ~terminated
+        done = terminated | time_out_not_terminated
+        done_count = done.float().sum()
+        truncation = {aid: time_out_not_terminated for aid in self.cfg.possible_agents}
+
+        self._debug_termination_metrics = {
+            "Termination / done count": done_count,
+            "Termination / success count": (both_reached & done).float().sum(),
+            "Termination / rollover count": (any_rolled & done).float().sum(),
+            "Termination / timeout count": time_out_not_terminated.float().sum(),
+            "Termination / success rate current": (both_reached & done).float().sum()
+            / torch.clamp(done_count, min=1.0),
+            "Termination / rollover rate current": (any_rolled & done).float().sum()
+            / torch.clamp(done_count, min=1.0),
+            "Termination / timeout rate current": time_out_not_terminated.float().sum()
+            / torch.clamp(done_count, min=1.0),
         }
 
         return termination, truncation
