@@ -174,10 +174,10 @@ action, or termination definitions.
 | Parameter | Default | Description |
 |:---|:---|:---|
 | `episode_length_s` | `60.0` | Max episode duration (seconds) |
-| `goal_reached_threshold` | `0.5` | Distance (m) for explorer goal completion |
-| `target_spawn_radius` | `5.0` | Max distance (m) for random target placement |
+| `goal_reached_threshold` | `0.25` | Distance (m) for explorer goal completion |
+| `target_spawn_radius` | `3.0` | Max distance (m) for random target placement |
 | `target_spawn_min_radius` | `2.0` | Min distance (m) for random target placement |
-| `target_min_separation` | `3.0` | Min distance (m) between explorer targets |
+| `target_min_separation` | `2.0` | Min distance (m) between explorer targets |
 | Target marker height | `1.5` | Visual marker offset above target ground position |
 | `safe_distance` | `None` (auto) | Min inter-rover distance (m). Auto = longest rover length |
 | `rollover_threshold_rad` | `1.31` | ~75 deg tilt for rollover termination |
