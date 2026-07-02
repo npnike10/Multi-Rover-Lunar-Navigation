@@ -44,8 +44,8 @@ R = w_progress  * mean(explorer_progress)
 | Weight | Default | Rationale |
 |:---|:---|:---|
 | `w_progress` | `1.0` | Dense shaped signal |
-| `w_goal` | `5.0` | Per-explorer sparse milestone bonus |
-| `w_proximity` | `5.0` | Discourages dangerous proximity |
+| `w_goal` | `1.0` | Per-explorer sparse milestone bonus |
+| `w_proximity` | `1.0` | Discourages dangerous proximity |
 | `w_action` | `0.1` | Light smoothness regularization |
 
 ---

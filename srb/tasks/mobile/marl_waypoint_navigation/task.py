@@ -6,7 +6,7 @@ individual waypoints; the supporter has no waypoint and must learn to
 assist the team through the shared reward signal.
 
 All agents receive the **exact same scalar reward** at each timestep (Dec-POMDP):
-    R = w_progress * mean(explorer_progress)
+    R = w_progress * mean(-explorer_goal_distance / target_spawn_radius)
       + w_goal     * (reached_exp1 + reached_exp2) / 2
       - w_proximity * mean(proximity_penalty over all rover pairs)
       - w_action    * mean(action_rate_penalty over all agents)
@@ -135,7 +135,8 @@ class MarlWaypointTaskCfg(GroundMarlEnvCfg):
             exceed the rollover threshold before the episode terminates.
             Prevents transient bounces from triggering termination. Default 5
             (0.2s at 25 Hz agent rate).
-        w_progress: Weight for mean explorer progress reward. Default 1.0.
+        w_progress: Weight for mean negative normalized explorer goal distance.
+            Default 1.0.
         w_goal: Weight for per-explorer goal-reached bonus. Default 5.0.
         w_proximity: Weight for inter-rover proximity penalty. Default 0.5.
         w_action: Weight for action-rate smoothness penalty. Default 0.1.
@@ -186,9 +187,9 @@ class MarlWaypointTaskCfg(GroundMarlEnvCfg):
     rollover_debounce_steps: int = 5  # 0.2s at 25 Hz
 
     # -- Dec-POMDP reward weights (single shared reward) ----------------------
-    w_progress: float = 1.0  # mean explorer progress
-    w_goal: float = 5.0  # per-explorer goal-reached bonus
-    w_proximity: float = 5  # inter-rover proximity penalty
+    w_progress: float = 1.0  # mean negative normalized explorer goal distance
+    w_goal: float = 1.0  # per-explorer goal-reached bonus
+    w_proximity: float = 1.0  # inter-rover proximity penalty
     w_action: float = 0.1  # action-rate smoothness penalty
     debug_metrics: bool = True
     live_reward_debug: bool = False
@@ -740,7 +741,7 @@ class MarlWaypointTask(GroundMarlEnv):
 
         All agents receive the **exact same scalar**::
 
-            R = w_progress * mean(explorer_progress)
+            R = w_progress * mean(-explorer_goal_distance / target_spawn_radius)
               + w_goal     * (reached_exp1 + reached_exp2) / 2
               - w_proximity * mean(proximity_penalty over all rover pairs)
               - w_action    * mean(action_rate over all agents)
@@ -749,12 +750,13 @@ class MarlWaypointTask(GroundMarlEnv):
         progress_terms = []
         distance_terms = {}
         distance_delta_terms = {}
+        distance_scale = max(float(self.cfg.target_spawn_radius), 1.0e-6)
         for aid in self.cfg.explorer_agents:
             pos_w = self._robots[aid].data.root_link_pose_w[:, :3]
             dist2d = torch.norm(pos_w[:, :2] - self._goals[aid][:, :2], dim=-1)
             distance_terms[aid] = dist2d
             distance_delta_terms[aid] = self._prev_goal_distances[aid] - dist2d
-            progress_terms.append(1.0 / (1.0 + dist2d))
+            progress_terms.append(-dist2d / distance_scale)
             # Update reached flags
             self._explorer_reached[aid] = dist2d < self.cfg.goal_reached_threshold
             self._last_goal_distances[aid] = dist2d
