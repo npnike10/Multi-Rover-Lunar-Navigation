@@ -125,6 +125,76 @@ def _install_native_wandb_scalar_logging() -> None:
         logging.warning(f"Failed to install native WandB scalar logging: {exc}")
 
 
+def _install_mappo_policy_action_logging() -> None:
+    """Track MAPPO policy mean and sampled actions without patching site-packages."""
+
+    def _track_action_stats(agent: Any, uid: str, prefix: str, actions: Any) -> None:
+        if (
+            actions is None
+            or getattr(actions, "ndim", 0) != 2
+            or actions.shape[-1] < 2
+        ):
+            return
+        agent.track_data(
+            f"Policy / {prefix} linear ({uid})", actions[:, 0].mean().item()
+        )
+        agent.track_data(
+            f"Policy / {prefix} angular ({uid})", actions[:, 1].mean().item()
+        )
+        agent.track_data(f"Policy / {prefix} abs ({uid})", actions.abs().mean().item())
+        agent.track_data(
+            f"Policy / {prefix} max abs ({uid})",
+            actions.abs().max(dim=-1).values.mean().item(),
+        )
+
+    try:
+        from skrl.multi_agents.torch.mappo import MAPPO
+
+        original = getattr(MAPPO, "act")
+        if getattr(original, "_srb_policy_action_logging_wrapped", False):
+            return
+
+        def act(self: Any, states: Any, timestep: int, timesteps: int):
+            actions, log_prob, outputs = original(self, states, timestep, timesteps)
+
+            try:
+                for uid, action in actions.items():
+                    mean_actions = outputs.get(uid, {}).get("mean_actions")
+                    _track_action_stats(self, uid, "Mean action", mean_actions)
+                    _track_action_stats(self, uid, "Sampled action", action)
+
+                    policy = self.policies.get(uid)
+                    distribution = (
+                        policy.distribution(role="policy") if policy is not None else None
+                    )
+                    stddev = getattr(distribution, "stddev", None)
+                    if (
+                        stddev is not None
+                        and getattr(stddev, "ndim", 0) == 2
+                        and stddev.shape[-1] >= 2
+                    ):
+                        self.track_data(
+                            f"Policy / Std action linear ({uid})",
+                            stddev[:, 0].mean().item(),
+                        )
+                        self.track_data(
+                            f"Policy / Std action angular ({uid})",
+                            stddev[:, 1].mean().item(),
+                        )
+            except Exception as exc:
+                if not getattr(self, "_srb_policy_action_logging_warned", False):
+                    logging.warning(f"Failed to log MAPPO policy action stats: {exc}")
+                    self._srb_policy_action_logging_warned = True
+
+            return actions, log_prob, outputs
+
+        act.__wrapped__ = original  # type: ignore[attr-defined]
+        act._srb_policy_action_logging_wrapped = True  # type: ignore[attr-defined]
+        setattr(MAPPO, "act", act)
+    except Exception as exc:
+        logging.warning(f"Failed to install MAPPO policy action logging: {exc}")
+
+
 def run(
     workflow: Literal["train", "eval"],
     env: "AnyEnv | gymnasium.Env",
@@ -193,6 +263,7 @@ def run(
 
     skrl_config.torch.device = env.device
     _install_native_wandb_scalar_logging()
+    _install_mappo_policy_action_logging()
 
     runner = Runner(
         env,  # type: ignore

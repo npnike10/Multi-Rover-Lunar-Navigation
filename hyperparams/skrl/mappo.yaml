@@ -59,3 +59,4 @@ trainer:
   class: SequentialTrainer
   timesteps: 50000000
   environment_info: log
+  stochastic_evaluation: True

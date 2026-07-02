@@ -861,6 +861,7 @@ class MarlWaypointTask(GroundMarlEnv):
     ) -> None:
         if not self.cfg.debug_metrics:
             self.extras.pop("episode", None)
+            self.extras.pop("log", None)
             return
 
         metrics = {
@@ -910,10 +911,12 @@ class MarlWaypointTask(GroundMarlEnv):
                 self._explorer_reached[aid].float().mean()
             )
 
-        self.extras["episode"] = {
+        debug_info = {
             key: value.detach() if isinstance(value, torch.Tensor) else value
             for key, value in metrics.items()
         }
+        self.extras["episode"] = debug_info
+        self.extras["log"] = debug_info
 
     # --------------------------------------------------------------------- #
     #  Termination / Truncation                                               #
