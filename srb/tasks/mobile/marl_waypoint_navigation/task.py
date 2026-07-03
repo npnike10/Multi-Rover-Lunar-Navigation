@@ -177,9 +177,9 @@ class MarlWaypointTaskCfg(GroundMarlEnvCfg):
 
     # -- Goal parameters ------------------------------------------------------
     goal_reached_threshold: float = 0.5  # meters
-    target_spawn_radius: float = 5.0  # max meters from env origin
-    target_spawn_min_radius: float = 2.0  # min meters from env origin
-    target_min_separation: float = 3.0  # min meters between the two targets
+    target_spawn_radius: float = 3.0  # max meters from env origin
+    target_spawn_min_radius: float = 3.0  # min meters from env origin
+    target_min_separation: float = 2.0  # min meters between the two targets
 
     # -- Safety parameters ----------------------------------------------------
     safe_distance: float | None = None  # None = auto (longest rover length)
