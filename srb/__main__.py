@@ -337,18 +337,46 @@ def random_agent(
 
     with torch.inference_mode():
         while sim_app.is_running():
-            action = torch.from_numpy(env.action_space.sample()).to(
-                device=env.unwrapped.device  # type: ignore
-            )
-            observation, reward, terminated, truncated, info = env.step(action)  # type: ignore
-            logging.trace(
-                f"action: {action}\n"
-                f"observation: {observation}\n"
-                f"reward: {reward}\n"
-                f"terminated: {terminated}\n"
-                f"truncated: {truncated}\n"
-                f"info: {info}\n"
-            )
+            if hasattr(env.unwrapped, "possible_agents"):
+                actions = {
+                    "supporter": torch.tensor(
+                        2 * torch.rand(1, 2) - 1,
+                        dtype=torch.float32,
+                        device=env.unwrapped.device,
+                    ),
+                    "explorer_1": torch.tensor(
+                        2 * torch.rand(1, 2) - 1,
+                        dtype=torch.float32,
+                        device=env.unwrapped.device,
+                    ),
+                    "explorer_2": torch.tensor(
+                        2 * torch.rand(1, 2) - 1,
+                        dtype=torch.float32,
+                        device=env.unwrapped.device,
+                    ),
+                }
+                observations, rewards, terminated, truncated, info = env.step(actions)
+                logging.trace(
+                    f"actions: {actions}\n"
+                    f"observations: {observations}\n"
+                    f"rewards: {rewards}\n"
+                    f"terminated: {terminated}\n"
+                    f"truncated: {truncated}\n"
+                    f"info: {info}\n"
+                )
+            else:
+                action = torch.from_numpy(env.action_space.sample()).to(
+                    device=env.unwrapped.device  # type: ignore
+                )
+                observation, reward, terminated, truncated, info = env.step(action)  # type: ignore
+                logging.trace(
+                    f"action: {action}\n"
+                    f"observation: {observation}\n"
+                    f"reward: {reward}\n"
+                    f"terminated: {terminated}\n"
+                    f"truncated: {truncated}\n"
+                    f"info: {info}\n"
+                )
 
 
 def zero_agent(
@@ -360,19 +388,46 @@ def zero_agent(
 
     from srb.utils import logging
 
-    action = torch.zeros(env.action_space.shape, device=env.unwrapped.device)  # type: ignore
+    if hasattr(env.unwrapped, "possible_agents"):
+        zero_actions = {
+            "supporter": torch.tensor(
+                [[0, 0.0]], dtype=torch.float32, device=env.unwrapped.device
+            ),
+            "explorer_1": torch.tensor(
+                [[0, 0.0]], dtype=torch.float32, device=env.unwrapped.device
+            ),
+            "explorer_2": torch.tensor(
+                [[0, 0.0]], dtype=torch.float32, device=env.unwrapped.device
+            ),
+        }
+        actions = {
+            agent: zero_actions[agent] for agent in env.unwrapped.possible_agents
+        }
+    else:
+        action = torch.zeros(env.action_space.shape, device=env.unwrapped.device)  # type: ignore
 
     with torch.inference_mode():
         while sim_app.is_running():
-            observation, reward, terminated, truncated, info = env.step(action)
-            logging.trace(
-                f"action: {action}\n"
-                f"observation: {observation}\n"
-                f"reward: {reward}\n"
-                f"terminated: {terminated}\n"
-                f"truncated: {truncated}\n"
-                f"info: {info}\n"
-            )
+            if hasattr(env.unwrapped, "possible_agents"):
+                observations, rewards, terminated, truncated, info = env.step(actions)
+                logging.trace(
+                    f"actions: {actions}\n"
+                    f"observations: {observations}\n"
+                    f"rewards: {rewards}\n"
+                    f"terminated: {terminated}\n"
+                    f"truncated: {truncated}\n"
+                    f"info: {info}\n"
+                )
+            else:
+                observation, reward, terminated, truncated, info = env.step(action)
+                logging.trace(
+                    f"action: {action}\n"
+                    f"observation: {observation}\n"
+                    f"reward: {reward}\n"
+                    f"terminated: {terminated}\n"
+                    f"truncated: {truncated}\n"
+                    f"info: {info}\n"
+                )
 
 
 def teleop_agent(
@@ -708,17 +763,19 @@ def _teleop_agent_via_policy(
                         env.unwrapped,
                         self._internal_cmd_attr_name,  # type: ignore
                         (
-                            cmd.repeat(
-                                self.env.unwrapped.cfg.scene.num_envs,  # type: ignore
-                                1,
+                            (
+                                cmd.repeat(
+                                    self.env.unwrapped.cfg.scene.num_envs,  # type: ignore
+                                    1,
+                                )
+                                if self._is_internal_cmd_attr_per_env
+                                else cmd
                             )
-                            if self._is_internal_cmd_attr_per_env
-                            else cmd
-                        )
-                        if not self._is_cmd_additive
-                        else (
-                            getattr(env.unwrapped, self._internal_cmd_attr_name)  # type: ignore
-                            + cmd
+                            if not self._is_cmd_additive
+                            else (
+                                getattr(env.unwrapped, self._internal_cmd_attr_name)  # type: ignore
+                                + cmd
+                            )
                         ),
                     )
                 case 7:
@@ -970,9 +1027,11 @@ def run_real_agent_with_env(
         )
         _generate_real_agent_subprocess(
             env_id=env_name,
-            forwarded_args=(*forwarded_args, "--hardware", *hardware)
-            if hardware
-            else forwarded_args,
+            forwarded_args=(
+                (*forwarded_args, "--hardware", *hardware)
+                if hardware
+                else forwarded_args
+            ),
         )
         logging.critical(
             f"Generated the missing RealEnv for {env_name}. Please re-run your desired workflow."
@@ -1104,9 +1163,11 @@ def generate_real_agent(
     if env_id.rsplit("/", 1)[-1] == "ALL":
         _generate_real_agent_subprocess(
             env_id="ALL",
-            forwarded_args=(*forwarded_args, "--hardware", *hardware)
-            if hardware
-            else forwarded_args,
+            forwarded_args=(
+                (*forwarded_args, "--hardware", *hardware)
+                if hardware
+                else forwarded_args
+            ),
         )
         return
 
@@ -1394,9 +1455,11 @@ def list_registered(
                         str(asset_type),
                         str(asset_subtype),
                         f"[link=vscode://file/{inspect.getabsfile(parent_class)}:{inspect.getsourcelines(parent_class)[1]}]{parent_class.__name__}[/link]",
-                        f"[link=vscode://file/{inspect.getabsfile(asset_cfg_class)}:{inspect.getsourcelines(asset_cfg_class)[1]}]{asset_cfg_class.__name__}[/link]"
-                        if asset_cfg_class is not _MISSING_TYPE
-                        else "<DYNAMIC>",
+                        (
+                            f"[link=vscode://file/{inspect.getabsfile(asset_cfg_class)}:{inspect.getsourcelines(asset_cfg_class)[1]}]{asset_cfg_class.__name__}[/link]"
+                            if asset_cfg_class is not _MISSING_TYPE
+                            else "<DYNAMIC>"
+                        ),
                         f"[link=vscode://file/{asset_module_path}]{asset_module_relpath}[/link]",
                         end_section=(j + 1) == len(asset_classes),
                     )
@@ -2090,9 +2153,11 @@ def parse_cli_args() -> argparse.Namespace:
             dest="env_id",
             help="Name of the environment to select",
             type=str,
-            action=AutoRealNamespaceTaskAction
-            if _parser in real_agent_parsers_with_env
-            else AutoNamespaceTaskAction,
+            action=(
+                AutoRealNamespaceTaskAction
+                if _parser in real_agent_parsers_with_env
+                else AutoNamespaceTaskAction
+            ),
             choices=(
                 env_choices
                 if _parser not in real_env_gen_parsers

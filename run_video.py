@@ -57,11 +57,7 @@ def update_camera(env):
 update_camera(env)
 
 for i in range(NUM_STEPS):
-    # Small noise keeps motion natural but preserves divergent directions
-    actions = {
-        agent: fixed_actions[agent] + torch.randn_like(fixed_actions[agent]) * 0.04
-        for agent in env.unwrapped.possible_agents
-    }
+    actions = {agent: fixed_actions[agent] for agent in env.unwrapped.possible_agents}
 
     obs, rewards, dones, truncs, infos = env.step(actions)
 
