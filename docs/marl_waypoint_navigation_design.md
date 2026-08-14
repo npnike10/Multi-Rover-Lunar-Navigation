@@ -1,194 +1,114 @@
-# MARL Waypoint Navigation — Environment Design Document (v4 — Ray Grid Configurable)
+# MARL Waypoint Navigation — SRB-Compatible Design
 
 ## Overview
 
-A **Dec-POMDP** multi-agent reinforcement learning environment with 3 lunar
-rovers (1 supporter + 2 explorers) on procedurally generated Moon terrain.
-All agents receive the **exact same reward** at each timestep. Explorers
-navigate to individual waypoints; the supporter has no target and must learn
-how to assist the team purely through the shared reward signal.
+`marl_waypoint_navigation` is a homogeneous-rover **Dec-POMDP** extension of
+SRB's state-based single-rover waypoint-navigation task.  Every rover has an
+individual moving planar waypoint.  It receives a decentralized noisy
+observation and the same scalar team reward as every other rover.
 
----
+The rover dictionary defines the agents.  The default contains three Leo
+rovers (`rover_1`, `rover_2`, and `rover_3`); setting the dictionary to one Leo
+rover creates the single-agent replication configuration.  There are no
+supporter/explorer roles, RayCaster terrain features, IMU features, rollover
+logic, or goal-completion termination.
 
-## Agent Roles
+## World, reset, and target dynamics
 
-### Explorers (`explorer_1`, `explorer_2`)
-- **Goal:** Navigate to their individual target waypoint.
-- **Reward contribution:** Progress toward target + goal-reached bonus.
+- The task uses SRB's Moon-domain `AssetVariant.PROCEDURAL` scenery.  At the
+  default 32 m spacing, this resolves to the default procedural `MoonSurface`
+  rather than the previous MARL-specific terrain override.
+- A one-rover run uses SRB's original reset ranges: XY in `[-0.5, 0.5]` m,
+  root height in `[0.4, 0.6]` m, yaw in `[-π, π]`, and the original initial
+  velocity ranges.  Multi-rover runs retain those height, yaw, and velocity
+  distributions but shift their XY window centers to prevent initial overlap.
+- Every virtual target starts at its environment origin with identity
+  orientation.  It evolves every 0.05 s via the same `offset_pose_natural`
+  event as SRB's waypoint task: XY step size `[0.005, 0.01]` m, position
+  smoothness `0.99`, step-size smoothness `0.8`, yaw-only orientation with
+  smoothness `0.8`, and XY bounds `±0.45 × environment spacing` (±14.4 m at
+  the default spacing).
+- Episodes end only at the 60 s time limit.
 
-### Supporter (`supporter`)
-- **Goal:** No waypoint target. The shared reward incentivizes the
-  supporter to learn whatever behavior helps the team succeed.
-- **Reward contribution:** None specific — benefits from the team reward.
+## Dec-POMDP definition
 
----
+For `N` rovers, all positions are two-dimensional task positions.
 
-## Dec-POMDP Shared Reward
-
-All agents receive the **exact same scalar** at each timestep:
-
-```
-R = w_progress  * mean(explorer_progress)
-  + w_goal      * (reached_exp1 + reached_exp2) / 2
-  - w_proximity * mean(proximity_penalty over all 3 rover pairs)
-  - w_action    * mean(action_rate_penalty over all 3 agents)
-```
-
-| Term | Formula | Range |
-|:---|:---|:---|
-| `progress_i` | `1 / (1 + dist_explorer_i_to_target)` | [0, 1] |
-| `reached_i` | `1.0 if dist < goal_reached_threshold` | {0, 1} |
-| `proximity(a,b)` | `max(0, 1 - dist(a,b) / safe_distance)` | [0, 1] |
-| `action_rate(a)` | `mean((a_t - a_{t-1})^2)` | [0, ~4] |
-
-| Weight | Default | Rationale |
-|:---|:---|:---|
-| `w_progress` | `1.0` | Dense shaped signal |
-| `w_goal` | `1.0` | Per-explorer sparse milestone bonus |
-| `w_proximity` | `1.0` | Discourages dangerous proximity |
-| `w_action` | `0.1` | Light smoothness regularization |
-
----
-
-## Observation Space (67 dims per agent by default)
-
-All agents share the same observation layout. The default observation is
-67-dimensional: 18 non-terrain features plus 49 terrain rays. The first
-2 dims differ semantically: explorers see relative XY to their target; the
-supporter receives zeros (no target).
-
-| Component | Dims | Source | Notes |
-|:---|:---|:---|:---|
-| Task target XY (explorers) / zeros (supporter) | 2 | `subtract_frame_transforms` | Body frame |
-| Other rover 1 relative XY | 2 | `subtract_frame_transforms` | Body frame |
-| Other rover 2 relative XY | 2 | `subtract_frame_transforms` | Body frame |
-| Body-frame linear velocity | 3 | `root_lin_vel_b` | Deployment: sensor fusion (wheel odom + IMU) |
-| IMU linear acceleration | 3 | `ImuData.lin_acc_b` | Body frame; captures terrain forces |
-| IMU angular velocity | 3 | `ImuData.ang_vel_b` | Body frame; gyroscope reading |
-| Projected gravity | 3 | `ImuData.projected_gravity_b` | (0,0,-1) when upright; detects slope and tilt |
-| RayCaster terrain heights | 49 default | `RayCasterData` | 7x7 grid by default, relative to sensor Z |
-| **Total** | **67 default** | | `18 + terrain_num_rays` |
-
-### Design Rationale
-- **Relative XY only** (no distance + heading): XY is sufficient; distance
-  and heading are derivable and add no information.
-- **No relative velocity of other rovers**: Preserves partial observability
-  (Dec-POMDP). A recurrent policy can infer velocity from consecutive
-  position observations.
-- **Body-frame velocity**: In deployment, estimated from sensor fusion.
-  In simulation, ground truth from PhysX (SRB convention).
-- **IMU acceleration**: Captures instantaneous terrain forces; useful for
-  low-level control even though velocity is also provided.
-- **Projected gravity**: NOT the gravitational constant (fixed on Moon).
-  It's the *direction* of gravity in body frame — shifts on slopes, crucial
-  for rollover awareness and slope-aware control.
-
----
-
-## Global State (198 dims by default, CTDE Centralized Critic)
-
-All in the **env-local frame** (world-aligned, origin at `env_origin`).
-Uses ground-truth data not available to the actor.
-
-| Component | Dims | Notes |
-|:---|:---|:---|
-| Pose_supporter | 9 | position(3) + 6D rotation(6) |
-| Pose_explorer_1 | 9 | |
-| Pose_explorer_2 | 9 | |
-| Velocity_supporter | 6 | lin_vel_w(3) + ang_vel_w(3), world frame |
-| Velocity_explorer_1 | 6 | |
-| Velocity_explorer_2 | 6 | |
-| Target_explorer_1 | 3 | Position relative to env_origin |
-| Target_explorer_2 | 3 | |
-| Terrain_supporter | 49 default | RayCaster heights |
-| Terrain_explorer_1 | 49 default | |
-| Terrain_explorer_2 | 49 default | |
-| **Total** | **198 default** | `51 + 3 * terrain_num_rays` |
-
-### Key Differences: State vs Observation
-| Aspect | Observation (Actor) | State (Critic) |
-|:---|:---|:---|
-| Velocity frame | Body frame | World frame |
-| Velocity source | `root_lin_vel_b` (local) | `root_lin_vel_w` (global, comparable) |
-| Orientation | Implicit (via projected_gravity) | Explicit 6D rotation |
-| Other rovers | Relative XY only | Full absolute poses |
-| Targets | Own target only | All targets |
-
----
-
-## Termination Conditions
-
-| Condition | Type | Details |
-|:---|:---|:---|
-| Both explorers reach targets | Termination (success) | `dist < goal_reached_threshold` for both simultaneously |
-| Rollover | Termination (failure) | Tilt > 75 degrees for 5 consecutive steps (0.2s debounce) |
-| Episode timeout | Truncation | `episode_length_s` exceeded |
-
-### Rollover Detection
-Uses `projected_gravity_b` from IMU (mathematically exact in sim):
-```python
-tilt = acos(clamp(-projected_gravity_b[:, 2], -1, 1))
-tilted = tilt > 1.31  # ~75 degrees
-# Must persist for 5 consecutive steps to trigger
-```
-
----
-
-## Sensors (per rover)
-
-| Sensor | Config | Data Used |
-|:---|:---|:---|
-| **IMU** | `ImuCfg` on chassis, `gravity_bias=(0,0,0)` | `lin_acc_b(3)`, `ang_vel_b(3)`, `projected_gravity_b(3)` |
-| **RayCaster** | 7x7 grid default, 0.25m spacing, 1.5m x 1.5m footprint, 2.0m max, downward | Relative terrain heights (49 default) |
-
-RayCaster grid parameters are configurable. Changing them changes the
-observation and state dimensions, so checkpoints trained with a different
-grid are not shape-compatible.
-
----
-
-## Reset / Spawn Behavior
-
-Rovers are reset with separated XY spawn windows around the environment
-origin:
-
-| Agent | XY center |
+| Element | Definition |
 |:---|:---|
-| `supporter` | `(-0.5, 0.0)` |
-| `explorer_1` | `(0.5, -0.5)` |
-| `explorer_2` | `(0.5, 0.5)` |
+| Agents | `I = {1, …, N}`; every rover owns target `g_i`. |
+| Actions | `a_i = (a_linear, a_angular) ∈ [-1, 1]^2`. The default Leo drive maps them to `v_linear = 0.4 a_linear` m/s and `v_angular = (π/3) a_angular` rad/s (60°/s). |
+| Local observation | `[noisy relative XY to g_i (2), noisy relative target yaw as sin/cos (2), noisy relative XY to each rover j ≠ i (2(N-1))]`; dimension `4 + 2(N-1)`. |
+| Critic state | Unnoised environment-relative rover `[XY, sin(yaw), cos(yaw)]` for all rovers, followed by the same fields for all targets; dimension `8N`. |
+| Reward | Common team scalar: mean of the original SRB six-term reward for every rover, minus the optional multi-agent proximity penalty. |
+| Termination | No success or rollover termination; timeout only. |
 
-Each center is randomized by ±0.2 m in X/Y. The root pose is spawned above
-the terrain (`z = 0.4..0.5`) with zero vertical, roll, and pitch velocity.
-This is an implementation safeguard for PhysX stability: setting the root
-height near zero can embed wheels/chassis in uneven terrain because the root
-frame is not the ground-contact point.
+The centralized-critic state is intentionally a compact planar task state.  It
+does not claim to be the complete simulator-Markov state: simulator velocities
+and latent target-motion state remain privileged physical information outside
+this vector.
 
-This reset behavior does not change the Dec-POMDP observation, state, reward,
-action, or termination definitions.
+## Observation noise
 
----
+The task follows the implementation of SRB's single-rover waypoint task:
 
-## Configurable Parameters
+```text
+relative XY measurement = true body-frame relative XY
+                        + episodic offset + per-step noise
 
-| Parameter | Default | Description |
-|:---|:---|:---|
-| `episode_length_s` | `60.0` | Max episode duration (seconds) |
-| `goal_reached_threshold` | `0.5` | Distance (m) for explorer goal completion |
-| `target_spawn_radius` | `3.0` | Max distance (m) for random target placement |
-| `target_spawn_min_radius` | `3.0` | Min distance (m) for random target placement |
-| `target_min_separation` | `2.0` | Min distance (m) between explorer targets |
-| Target marker height | `1.5` | Visual marker offset above target ground position |
-| `safe_distance` | `None` (auto) | Min inter-rover distance (m). Auto = longest rover length |
-| `rollover_threshold_rad` | `1.31` | ~75 deg tilt for rollover termination |
-| `rollover_debounce_steps` | `5` | Consecutive steps before rollover triggers (0.2s) |
-| `w_progress` | `1.0` | Explorer progress reward weight |
-| `w_goal` | `5.0` | Per-explorer goal-reached weight |
-| `w_proximity` | `0.5` | Inter-rover proximity penalty weight |
-| `w_action` | `0.1` | Action-rate penalty weight |
-| `terrain_grid_size` | `(1.5, 1.5)` | RayCaster footprint `(length, width)` in meters |
-| `terrain_grid_resolution` | `0.25` | Ray spacing in meters; default produces 7x7 = 49 rays |
-| `raycaster_max_distance` | `2.0` | Maximum downward ray distance in meters |
-| `env_rate` | `1/50` | Physics rate (50 Hz) |
-| `agent_rate` | `1/25` | Decision rate (25 Hz, decimation=2) |
-| `debug_flat_scenery` | `False` | Debug-only option to replace procedural terrain with a flat ground plane |
+episodic XY offset ~ Normal(0, 0.01² I₂)
+per-step XY noise  ~ Normal(0, 0.0025² I₂)
+
+episodic target-yaw offset ~ Normal(0, (2.5°)²)
+per-step target-yaw noise  ~ Normal(0, (0.5°)²)
+```
+
+The per-step term is noise, not a persistent bias.  Each directed
+observer-to-entity XY relation has an independent episodic offset and fresh
+per-step sample.  Thus rover `i`'s measurement of rover `j` is independently
+noised from rover `j`'s measurement of rover `i`.  Target yaw follows the
+single-rover SRB convention and is encoded as `[sin(yaw), cos(yaw)]` after
+noise is applied.
+
+This corrects the earlier proposed XY values of `0.012` and `0.00252`: SRB's
+current waypoint-task implementation uses `0.01` and `0.0025`, respectively.
+Target yaw must remain observable because it is directly rewarded.
+
+## Shared reward
+
+For each rover, the task computes SRB's original state-based components using
+its true target-relative pose and normalized action change:
+
+```text
+action_rate                    = mean((a_t - a_{t-1})²)
+distance                       = ||relative_target_XY||
+position_precision             = 1 - tanh(distance / 0.05)
+orientation_precision          = position_precision
+                               * (1 - tanh(|relative_target_yaw| / 0.2618))
+
+r_i = -0.5 * action_rate
+    - distance²
+    + (1 - tanh(|heading_to_target| / 0.7854))
+    + 4  * position_precision
+    + 8  * orientation_precision
+    + 32 * orientation_precision * (1 - tanh(action_rate / 0.1))
+
+R_team = mean_i(r_i) - w_proximity * mean_pairs(max(0, 1 - d_xy / d_safe))
+```
+
+`w_proximity` defaults to `0.0`; `d_safe` defaults to a conservative inferred
+rover length and can be configured explicitly.  The pair term is zero for a
+single rover.  Consequently, one rover with the default proximity weight has
+the original SRB reward exactly; multi-rover training intentionally uses a
+shared average rather than independent rewards.
+
+## Compatibility notes
+
+- The literal single-rover task class defaults to the Perseverance rover
+  (0.7 m/s and 75°/s).  This MARL task intentionally uses Leo Rover so that its
+  requested 0.4 m/s and 60°/s action mapping is preserved.
+- The target-relative target yaw is an orientation error, not the heading from
+  rover to target.  Both are used separately by the SRB reward.
+- Changing the number of `robots` changes the agent set and the local/state
+  dimensions.  Policies and critics trained with one team size are therefore
+  not shape-compatible with another.

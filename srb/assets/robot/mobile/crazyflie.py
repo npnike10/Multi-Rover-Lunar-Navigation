@@ -20,7 +20,7 @@ class Crazyflie(Multicopter):
     asset_cfg: ArticulationCfg = ArticulationCfg(
         prim_path="{ENV_REGEX_NS}/crazyflie",
         spawn=UsdFileCfg(
-            usd_path=f"{ISAAC_NUCLEUS_DIR}/Robots/Crazyflie/cf2x.usd",
+            usd_path=f"{ISAAC_NUCLEUS_DIR}/Robots/Bitcraze/Crazyflie/cf2x.usd",
             collision_props=CollisionPropertiesCfg(
                 contact_offset=0.005, rest_offset=0.0
             ),

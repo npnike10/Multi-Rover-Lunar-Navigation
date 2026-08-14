@@ -1,322 +1,262 @@
-"""MARL Waypoint Navigation Task for Space Robotics Bench.
+"""SRB-compatible multi-agent waypoint navigation task.
 
-Multi-agent Dec-POMDP environment with 3 lunar rovers (1 supporter + 2
-explorers) on procedurally generated Moon terrain. Explorers navigate to
-individual waypoints; the supporter has no waypoint and must learn to
-assist the team through the shared reward signal.
+This task is a Dec-POMDP extension of SRB's state-based single-rover waypoint
+navigation task.  Every rover owns one moving planar waypoint and receives the
+same team reward: the mean of the original SRB per-rover rewards, optionally
+minus a rover--rover proximity penalty.  Configuring one rover and leaving
+``w_proximity`` at zero reproduces the original task's task signals.
 
-All agents receive the **exact same scalar reward** at each timestep (Dec-POMDP):
-    R = w_progress * mean(-explorer_goal_distance / target_spawn_radius)
-      + w_goal     * (reached_exp1 + reached_exp2) / 2
-      - w_proximity * mean(proximity_penalty over all rover pairs)
-      - w_action    * mean(action_rate_penalty over all agents)
-
-Global State (198 dims by default, CTDE centralized critic):
-    [Pose_sup(9), Pose_exp1(9), Pose_exp2(9),
-     Vel_sup(6),  Vel_exp1(6),  Vel_exp2(6),
-     Target_exp1(3), Target_exp2(3),
-     Terrain_sup(49), Terrain_exp1(49), Terrain_exp2(49)]
-
-Local Observation (67 dims by default per agent, decentralized actor):
-    [task_xy(2), other_rover1_xy(2), other_rover2_xy(2),
-     lin_vel_b(3), imu_lin_acc(3), imu_ang_vel(3), projected_gravity(3),
-     terrain(49)]
-
-Actions (2 dims per agent): [linear_velocity, angular_velocity]
-
-Termination: both explorers reach targets OR any rover rolls over.
-Truncation:  time limit exceeded.
+Each decentralized observation contains the rover's noisy target-relative XY
+position, noisy target-relative yaw encoded as sine/cosine, and noisy relative
+XY positions for all other rovers.  The task deliberately has no RayCaster,
+IMU, terrain observation, goal-completion, or rollover signal.
 """
 
 import math
 from typing import Sequence
 
+import gymnasium
 import torch
-from dataclasses import MISSING
 
 from srb import assets
+from srb.core.asset import AssetVariant, Scenery
 from srb.core.env.mobile.ground.marl_env import (
     GroundMarlEnv,
     GroundMarlEnvCfg,
-    GroundMarlSceneCfg,
     GroundMarlEventCfg,
+    GroundMarlSceneCfg,
 )
-from srb.core.manager import ActionManager
+from srb.core.manager import ActionManager, EventTermCfg
 from srb.core.marker import VisualizationMarkers, VisualizationMarkersCfg
+from srb.core.mdp import offset_pose_natural
 from srb.core.sim import PreviewSurfaceCfg
 from srb.core.sim.spawners.shapes.extras.cfg import PinnedArrowCfg
-from srb.core.asset import AssetVariant
-from srb.core.marker import RED_ARROW_X_MARKER_CFG
-from srb.core.sensor import ImuCfg
-
-# Import Isaac Lab sensor configs
-from isaaclab.sensors.ray_caster import RayCasterCfg, patterns
-
 from srb.utils.cfg import configclass
-from srb.utils.math import matrix_from_quat, subtract_frame_transforms, quat_to_rot6d
+from srb.utils.math import matrix_from_quat, subtract_frame_transforms
+
 
 ###############################################################################
-# Scene Configuration
+# Scene and event configuration
 ###############################################################################
-
-import isaaclab.sim as sim_utils
-from isaaclab.assets import RigidObjectCfg
 
 
 @configclass
 class MarlWaypointSceneCfg(GroundMarlSceneCfg):
-    target_1: RigidObjectCfg = RigidObjectCfg(
-        prim_path="{ENV_REGEX_NS}/target_1",
-        spawn=sim_utils.ConeCfg(
-            radius=0.2,
-            height=0.4,
-            rigid_props=sim_utils.RigidBodyPropertiesCfg(
-                kinematic_enabled=True,
-                disable_gravity=True,
-                enable_gyroscopic_forces=False,
-            ),
-            collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=False),
-            visual_material=PreviewSurfaceCfg(
-                diffuse_color=(0.0, 0.0, 1.0), emissive_color=(0.0, 0.0, 1.0)
-            ),
-        ),
-        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.0, 0.0, 5.0)),
-    )
+    """Scene configuration for the procedural lunar waypoint task."""
 
-    target_2: RigidObjectCfg = RigidObjectCfg(
-        prim_path="{ENV_REGEX_NS}/target_2",
-        spawn=sim_utils.ConeCfg(
-            radius=0.2,
-            height=0.4,
-            rigid_props=sim_utils.RigidBodyPropertiesCfg(
-                kinematic_enabled=True,
-                disable_gravity=True,
-                enable_gyroscopic_forces=False,
-            ),
-            collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=False),
-            visual_material=PreviewSurfaceCfg(
-                diffuse_color=(0.0, 1.0, 0.0), emissive_color=(0.0, 1.0, 0.0)
-            ),
-        ),
-        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.0, 0.0, 5.0)),
-    )
+
+@configclass
+class MarlWaypointEventCfg(GroundMarlEventCfg):
+    """Holds reset events and one natural-motion event per rover target."""
 
 
 ###############################################################################
-# Configuration
+# Task configuration
 ###############################################################################
 
 
 @configclass
 class MarlWaypointTaskCfg(GroundMarlEnvCfg):
-    """Configuration for the MARL Waypoint Navigation environment.
+    """Configuration for SRB-compatible multi-agent waypoint navigation.
 
-    Dec-POMDP with 3 lunar rovers (1 supporter + 2 explorers) on procedurally
-    generated Moon terrain. All agents receive the same shared reward.
+    The default configuration has three identical Leo rovers.  The rover
+    dictionary is the sole source of agent identities, so a one-rover
+    configuration is supported without a separate task class.
 
-    Attributes:
-        goal_reached_threshold: Distance (m) within which an explorer is
-            considered to have reached its target. Default 0.5 m.
-        target_spawn_radius: Maximum distance (m) from env origin at which
-            explorer targets are randomly spawned. Default 5.0 m.
-        target_spawn_min_radius: Minimum distance (m) from env origin at
-            which explorer targets are spawned. Ensures targets are not too
-            close to the starting area. Default 2.0 m.
-        target_min_separation: Minimum distance (m) between the two explorer
-            targets. Ensures explorers must navigate to distinct locations.
-            Default 3.0 m. Uses rejection sampling (max 100 attempts).
-        safe_distance: Minimum safe distance (m) between any two rovers.
-            If None (default), automatically set to the length of the longest
-            rover among all agents. Can be overridden with a float.
-        rollover_threshold_rad: Tilt angle (radians) beyond which a rover is
-            considered rolled over and the episode terminates. Default 1.31
-            (~75 degrees).
-        rollover_debounce_steps: Number of consecutive timesteps a rover must
-            exceed the rollover threshold before the episode terminates.
-            Prevents transient bounces from triggering termination. Default 5
-            (0.2s at 25 Hz agent rate).
-        w_progress: Weight for mean negative normalized explorer goal distance.
-            Default 1.0.
-        w_goal: Weight for per-explorer goal-reached bonus. Default 5.0.
-        w_proximity: Weight for inter-rover proximity penalty. Default 0.5.
-        w_action: Weight for action-rate smoothness penalty. Default 0.1.
-        terrain_grid_size: RayCaster grid footprint (length, width) in meters.
-            Default (1.5, 1.5).
-        terrain_grid_resolution: RayCaster grid spacing in meters. Default
-            0.25, producing a 7x7 grid over the default footprint.
-        raycaster_max_distance: Maximum downward ray distance in meters.
-            Default 2.0.
+    The procedural scenery is intentionally left as ``AssetVariant.PROCEDURAL``.
+    With the Moon domain and 32 m spacing, SRB resolves it to its default
+    ``MoonSurface`` configuration rather than the former MARL-specific terrain
+    override.
     """
 
-    # -- Scene ----------------------------------------------------------------
+    # -- Scene and world -----------------------------------------------------
     scene: MarlWaypointSceneCfg = MarlWaypointSceneCfg(env_spacing=32.0)
-
-    # -- Terrain --------------------------------------------------------------
-    from srb.core.asset import Scenery
-
+    events: MarlWaypointEventCfg = MarlWaypointEventCfg()
+    stack: bool = True
     scenery: Scenery | AssetVariant = AssetVariant.PROCEDURAL
-    debug_flat_scenery: bool = False
-    terrain_grid_size: tuple[float, float] = (1.5, 1.5)
-    terrain_grid_resolution: float = 0.25
-    raycaster_max_distance: float = 2.0
 
-    # -- Rovers ---------------------------------------------------------------
+    # -- Homogeneous rover team ---------------------------------------------
+    # LeoRover maps normalized [linear, angular] actions to 0.4 m/s and
+    # 60 deg/s respectively.  Use this robot for replication of the requested
+    # action bounds and scaling.
     robots = {
-        "supporter": assets.LeoRover(),
-        "explorer_1": assets.LeoRover(),
-        "explorer_2": assets.LeoRover(),
+        "rover_1": assets.LeoRover(),
+        "rover_2": assets.LeoRover(),
+        "rover_3": assets.LeoRover(),
     }
 
-    # -- Agent role classification --------------------------------------------
-    explorer_agents: list = ["explorer_1", "explorer_2"]
-    supporter_agent: str = "supporter"
-
-    # -- Episode --------------------------------------------------------------
+    # -- Time ---------------------------------------------------------------
     episode_length_s: float = 60.0
     is_finite_horizon: bool = False
 
-    # -- Goal parameters ------------------------------------------------------
-    goal_reached_threshold: float = 0.5  # meters
-    target_spawn_radius: float = 3.0  # max meters from env origin
-    target_spawn_min_radius: float = 3.0  # min meters from env origin
-    target_min_separation: float = 2.0  # min meters between the two targets
+    # -- Moving waypoint event (matches the single-rover SRB task) ----------
+    target_event_interval_s: float = 0.05
+    target_pos_step_range: tuple[float, float] = (0.005, 0.01)
+    target_pos_smoothness: float = 0.99
+    target_pos_step_smoothness: float = 0.8
+    target_orient_smoothness: float = 0.8
+    target_pos_range_ratio: float = 0.9
 
-    # -- Safety parameters ----------------------------------------------------
-    safe_distance: float | None = None  # None = auto (longest rover length)
-    rollover_threshold_rad: float = 1.31  # ~75 degrees
-    rollover_debounce_steps: int = 5  # 0.2s at 25 Hz
+    # -- Observation noise (matches the single-rover SRB task) -------------
+    # Noise is per coordinate.  Each directed observer-to-entity XY relation
+    # has an independent episodic offset and independent per-observation noise.
+    episodic_xy_noise_std: float = 0.01
+    per_step_xy_noise_std: float = 0.0025
+    episodic_yaw_noise_std: float = math.radians(2.5)
+    per_step_yaw_noise_std: float = math.radians(0.5)
 
-    # -- Dec-POMDP reward weights (single shared reward) ----------------------
-    w_progress: float = 1.0  # mean negative normalized explorer goal distance
-    w_goal: float = 1.0  # per-explorer goal-reached bonus
-    w_proximity: float = 1.0  # inter-rover proximity penalty
-    w_action: float = 0.1  # action-rate smoothness penalty
-    debug_metrics: bool = True
-    live_reward_debug: bool = False
-    live_reward_debug_interval: int = 25
-    live_action_debug: bool = False
-    live_action_debug_interval: int = 25
+    # -- Multi-agent-only team safety term ----------------------------------
+    w_proximity: float = 0.0
+    proximity_safe_distance: float | None = None
 
-    # -- Delays ---------------------------------------------------------------
-    action_delay_steps: int = 0
-    observation_delay_steps: int = 0
+    # -- Visuals -------------------------------------------------------------
+    target_marker_cfg: VisualizationMarkersCfg = VisualizationMarkersCfg(
+        prim_path="/Visuals/marl_waypoint_targets",
+        markers={
+            "target": PinnedArrowCfg(
+                pin_radius=0.01,
+                pin_length=2.0,
+                tail_radius=0.01,
+                tail_length=0.2,
+                head_radius=0.04,
+                head_length=0.08,
+                visual_material=PreviewSurfaceCfg(emissive_color=(0.2, 0.2, 0.8)),
+            )
+        },
+    )
 
-    # -- Space metadata -------------------------------------------------------
-    # Obs per agent : 18 non-terrain dims + terrain_num_rays
-    # State (global): 51 non-terrain dims + num_agents * terrain_num_rays
-    # Act per agent : 2    (linear + angular velocity)
+    # -- Space metadata ------------------------------------------------------
+    # Local observation: target XY (2), target yaw sin/cos (2), and XY for
+    # every other rover (2 each): 4 + 2 * (N - 1).
+    # Centralized state: rover XY/yaw sin-cos (4 each) followed by target
+    # XY/yaw sin-cos (4 each): 8 * N.
     observation_spaces: dict = None  # type: ignore[assignment]
     action_spaces: dict = None  # type: ignore[assignment]
-    state_space: int = 0  # set in __post_init__
-
-    @staticmethod
-    def _terrain_axis_ray_count(size: float, resolution: float) -> int:
-        """Match Isaac Lab GridPatternCfg's inclusive arange ray count."""
-        if size <= 0.0:
-            raise ValueError(f"terrain_grid_size values must be > 0. Received: {size}")
-        if resolution <= 0.0:
-            raise ValueError(
-                f"terrain_grid_resolution must be > 0. Received: {resolution}"
-            )
-        return math.floor(size / resolution + 1.0e-9) + 1
-
-    @property
-    def terrain_num_rays(self) -> int:
-        x_count = self._terrain_axis_ray_count(
-            self.terrain_grid_size[0], self.terrain_grid_resolution
-        )
-        y_count = self._terrain_axis_ray_count(
-            self.terrain_grid_size[1], self.terrain_grid_resolution
-        )
-        return x_count * y_count
+    state_space: gymnasium.Space = gymnasium.spaces.Box(
+        low=-math.inf, high=math.inf, shape=(1,)
+    )
 
     @property
     def local_observation_dim(self) -> int:
-        return 18 + self.terrain_num_rays
+        """Dimension of one rover's decentralized observation."""
+        return 4 + 2 * (len(self.robots) - 1)
 
     @property
     def global_state_dim(self) -> int:
-        return 51 + len(self.robots) * self.terrain_num_rays
+        """Dimension of the compact, unnoised centralized-critic state."""
+        return 8 * len(self.robots)
 
     def __post_init__(self):
-        if self.debug_flat_scenery:
-            self.scenery = assets.GroundPlane()
-
-        # Terrain must be stacked so the single /World/scenery mesh is
-        # visible to all RayCasters.
-        self.stack = True
-
-        # Populate space metadata BEFORE super().__post_init__()
         agent_ids = list(self.robots.keys())
-        self.observation_spaces = {aid: self.local_observation_dim for aid in agent_ids}
-        self.action_spaces = {aid: 2 for aid in agent_ids}
-        self.possible_agents = agent_ids
+        if not agent_ids:
+            raise ValueError("MarlWaypointTaskCfg.robots must contain at least one rover.")
 
-        self.state_space = self.global_state_dim
+        # The target events must exist before the base configuration builds its
+        # event manager.  ``spacing`` may be supplied explicitly; otherwise it
+        # is inherited from the 32 m scene configuration.
+        target_bound = 0.5 * self.target_pos_range_ratio * (
+            self.spacing if self.spacing is not None else self.scene.env_spacing
+        )
+        for agent_id in agent_ids:
+            setattr(
+                self.events,
+                f"target_{agent_id}_pose_evolution",
+                EventTermCfg(
+                    func=offset_pose_natural,
+                    mode="interval",
+                    interval_range_s=(
+                        self.target_event_interval_s,
+                        self.target_event_interval_s,
+                    ),
+                    is_global_time=True,
+                    params={
+                        "env_attr_name": f"_target_goal_{agent_id}",
+                        "pos_axes": ("x", "y"),
+                        "pos_step_range": self.target_pos_step_range,
+                        "pos_smoothness": self.target_pos_smoothness,
+                        "pos_step_smoothness": self.target_pos_step_smoothness,
+                        "pos_bounds": {
+                            "x": (-target_bound, target_bound),
+                            "y": (-target_bound, target_bound),
+                        },
+                        "orient_yaw_only": True,
+                        "orient_smoothness": self.target_orient_smoothness,
+                    },
+                ),
+            )
+
+        self.possible_agents = agent_ids
+        self.observation_spaces = {
+            agent_id: gymnasium.spaces.Box(
+                low=-math.inf,
+                high=math.inf,
+                shape=(self.local_observation_dim,),
+            )
+            for agent_id in agent_ids
+        }
+        self.action_spaces = {
+            agent_id: gymnasium.spaces.Box(
+                low=-1.0,
+                high=1.0,
+                shape=(2,),
+            )
+            for agent_id in agent_ids
+        }
+        self.state_space = gymnasium.spaces.Box(
+            low=-math.inf,
+            high=math.inf,
+            shape=(self.global_state_dim,),
+        )
 
         super().__post_init__()
 
-        # -- Fix base GroundMarlEnv randomize events --
-        # Keep the rovers separated and reset them above the terrain.
-        # Starting near z=0 can place wheels/chassis inside uneven procedural
-        # terrain, which is enough to poison GPU PhysX with CUDA error 700.
-        spawn_offsets = {
-            "supporter": (-0.5, 0.0),
-            "explorer_1": (0.5, -0.5),
-            "explorer_2": (0.5, 0.5),
-        }
-        for agent_id in self.robots.keys():
+        # Reproduce the original reset ranges for one rover.  For multi-rover
+        # runs, only the XY centers are adapted to keep the rovers separated;
+        # yaw, height, and velocity distributions remain those of SRB's task.
+        for index, agent_id in enumerate(agent_ids):
             event_cfg = getattr(self.events, f"randomize_{agent_id}_state")
-            dx, dy = spawn_offsets.get(agent_id, (0.0, 0.0))
-            event_cfg.params["pose_range"]["x"] = (dx - 0.2, dx + 0.2)
-            event_cfg.params["pose_range"]["y"] = (dy - 0.2, dy + 0.2)
-            event_cfg.params["pose_range"]["z"] = (0.4, 0.5)
-            event_cfg.params["velocity_range"]["z"] = (0.0, 0.0)
-            event_cfg.params["velocity_range"]["roll"] = (0.0, 0.0)
-            event_cfg.params["velocity_range"]["pitch"] = (0.0, 0.0)
-
-        # ---- Per-rover sensor injection ----
-        for agent_id, robot_cfg in self.robots.items():
-            # RayCaster: downward-facing terrain grid. Default is 7x7 rays
-            # over a 1.5 m x 1.5 m footprint.
-            setattr(
-                self.scene,
-                f"raycaster_{agent_id}",
-                RayCasterCfg(
-                    prim_path=f"{{ENV_REGEX_NS}}/robot_{agent_id}/chassis",
-                    update_period=self.agent_rate,
-                    offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 0.5)),
-                    mesh_prim_paths=["/World/scenery"],
-                    pattern_cfg=patterns.GridPatternCfg(
-                        resolution=self.terrain_grid_resolution,
-                        size=self.terrain_grid_size,
-                        direction=(0.0, 0.0, -1.0),
-                    ),
-                    max_distance=self.raycaster_max_distance,
-                    debug_vis=False,
-                ),
+            x_center, y_center, xy_half_range = self._spawn_window(
+                index, len(agent_ids)
+            )
+            event_cfg.params["pose_range"]["x"] = (
+                x_center - xy_half_range,
+                x_center + xy_half_range,
+            )
+            event_cfg.params["pose_range"]["y"] = (
+                y_center - xy_half_range,
+                y_center + xy_half_range,
+            )
+            event_cfg.params["pose_range"]["z"] = (0.4, 0.6)
+            event_cfg.params["pose_range"]["yaw"] = (-torch.pi, torch.pi)
+            event_cfg.params["velocity_range"].update(
+                {
+                    "x": (-0.5, 0.5),
+                    "y": (-0.5, 0.5),
+                    "z": (0.0, 0.5),
+                    "roll": (-math.radians(5.0), math.radians(5.0)),
+                    "pitch": (-math.radians(5.0), math.radians(5.0)),
+                    "yaw": (-math.radians(15.0), math.radians(15.0)),
+                }
             )
 
-            # IMU: attached to chassis (frame_base) for each rover.
-            # Provides lin_acc_b, ang_vel_b, and projected_gravity_b.
-            # gravity_bias=(0,0,0) matches SRB convention (no bias added).
-            prim_path = f"{{ENV_REGEX_NS}}/robot_{agent_id}/chassis"
-            imu_cfg = ImuCfg(
-                prim_path=prim_path,
-                gravity_bias=(0.0, 0.0, 0.0),
-                visualizer_cfg=RED_ARROW_X_MARKER_CFG.replace(
-                    prim_path=f"/Visuals/imu_{agent_id}/lin_acc"
-                ),
-            )
-            # Use frame_imu offset if available, otherwise frame_base
-            if hasattr(robot_cfg, "frame_imu") and robot_cfg.frame_imu is not None:
-                imu_cfg.offset.pos = robot_cfg.frame_imu.offset.pos
-                imu_cfg.offset.rot = robot_cfg.frame_imu.offset.rot
-            elif hasattr(robot_cfg, "frame_base") and robot_cfg.frame_base is not None:
-                imu_cfg.offset.pos = robot_cfg.frame_base.offset.pos
-                imu_cfg.offset.rot = robot_cfg.frame_base.offset.rot
+    @staticmethod
+    def _spawn_window(index: int, count: int) -> tuple[float, float, float]:
+        """Return a separated SRB-style reset window for one rover.
 
-            setattr(self.scene, f"imu_{agent_id}", imu_cfg)
+        A single rover uses the original ``[-0.5, 0.5]`` XY ranges.  The
+        three-rover default uses the former task's proven non-overlapping
+        centers with a 0.2 m jitter.  Other team sizes use evenly spaced points
+        on a 1 m radius circle with the same jitter.
+        """
+        if count == 1:
+            return 0.0, 0.0, 0.5
+        if count == 2:
+            return (-0.5, 0.0, 0.2) if index == 0 else (0.5, 0.0, 0.2)
+        if count == 3:
+            return ((-0.5, 0.0, 0.2), (0.5, -0.5, 0.2), (0.5, 0.5, 0.2))[index]
+
+        angle = 2.0 * math.pi * index / count
+        return math.cos(angle), math.sin(angle), 0.2
 
 
 ###############################################################################
@@ -325,15 +265,11 @@ class MarlWaypointTaskCfg(GroundMarlEnvCfg):
 
 
 class MarlWaypointTask(GroundMarlEnv):
-    """Multi-Agent Waypoint Navigation on procedural lunar terrain (Dec-POMDP).
+    """Shared-reward Dec-POMDP extension of SRB waypoint navigation.
 
-    MDP Components
-    --------------
-    * ``_get_observations``:  local obs per agent (67 dims by default).
-    * ``_get_states``:        privileged global state for CTDE critic
-                              (198 dims by default).
-    * ``_get_rewards``:       Single shared Dec-POMDP reward for all agents.
-    * ``_get_dones``:         Terminate on joint goal-reach or rollover.
+    No physical sensor object is created for this task.  Target and rover
+    relative positions are task-state measurements; configurable Gaussian noise
+    is applied directly when decentralized observations are constructed.
     """
 
     cfg: MarlWaypointTaskCfg
@@ -342,649 +278,317 @@ class MarlWaypointTask(GroundMarlEnv):
         super().__init__(cfg, **kwargs)
 
         self.action_manager = ActionManager(self.cfg.actions, env=self)
-        self._wheeled_drive_terms = {
-            aid: self.action_manager._terms.get(f"robot_{aid}/wheeled_drive")
-            for aid in self.cfg.possible_agents
+        self._actions = {
+            agent_id: torch.zeros(self.num_envs, 2, device=self.device)
+            for agent_id in self.cfg.possible_agents
+        }
+        self._previous_actions = {
+            agent_id: torch.zeros(self.num_envs, 2, device=self.device)
+            for agent_id in self.cfg.possible_agents
         }
 
-        # -- Per-agent action buffers (for action-rate penalty) --
-        self._actions_dict = {
-            aid: torch.zeros(self.num_envs, 2, device=self.device)
-            for aid in self.cfg.possible_agents
+        # Goals are virtual 7D poses.  The dynamic events mutate each named
+        # tensor in place; the dictionary provides convenient agent lookup.
+        self._goal_attr_names = {
+            agent_id: f"_target_goal_{agent_id}"
+            for agent_id in self.cfg.possible_agents
         }
-        self._prev_actions_dict = {
-            aid: torch.zeros(self.num_envs, 2, device=self.device)
-            for aid in self.cfg.possible_agents
-        }
+        self._goals: dict[str, torch.Tensor] = {}
+        for agent_id, attr_name in self._goal_attr_names.items():
+            goal = torch.zeros(self.num_envs, 7, device=self.device)
+            goal[:, :3] = self.scene.env_origins
+            goal[:, 3] = 1.0
+            setattr(self, attr_name, goal)
+            self._goals[agent_id] = goal
 
-        # -- RayCaster handles --
-        self._raycasters = {
-            aid: self.scene[f"raycaster_{aid}"] for aid in self.cfg.possible_agents
+        # XY offsets are independent for each ordered observer/entity pair.
+        # ``target`` denotes the observer's own target; every other key denotes
+        # a physical rover visible to that observer.
+        self._episodic_xy_noise = {
+            (observer, entity): torch.zeros(self.num_envs, 2, device=self.device)
+            for observer in self.cfg.possible_agents
+            for entity in [
+                "target",
+                *[
+                    other
+                    for other in self.cfg.possible_agents
+                    if other != observer
+                ],
+            ]
         }
-
-        # -- IMU handles --
-        # Retrieved from scene; the base MobileMarlEnv.__init__ populates
-        # self._imus if the sensors were added to the scene config.
-        # We ensure they exist here as well.
-        if not self._imus:
-            self._imus = {
-                aid: self.scene[f"imu_{aid}"] for aid in self.cfg.possible_agents
-            }
-
-        # -- Goal buffers (explorers only — supporter has no waypoint) --
-        self._goals = {
-            aid: torch.zeros(self.num_envs, 3, device=self.device)
-            for aid in self.cfg.explorer_agents
+        self._episodic_yaw_noise = {
+            agent_id: torch.zeros(self.num_envs, device=self.device)
+            for agent_id in self.cfg.possible_agents
         }
-        for aid in self.cfg.explorer_agents:
-            self._goals[aid][:, :3] = self.scene.env_origins[:, :3]
-
-        # -- Per-explorer "reached" flag --
-        self._explorer_reached = {
-            aid: torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-            for aid in self.cfg.explorer_agents
-        }
-        self._prev_goal_distances = {
-            aid: torch.zeros(self.num_envs, device=self.device)
-            for aid in self.cfg.explorer_agents
-        }
-        self._last_goal_distances = {
-            aid: torch.zeros(self.num_envs, device=self.device)
-            for aid in self.cfg.explorer_agents
-        }
-
-        # -- Rollover debounce counter (per rover, per env) --
-        self._rollover_count = {
-            aid: torch.zeros(self.num_envs, dtype=torch.int32, device=self.device)
-            for aid in self.cfg.possible_agents
-        }
-
-        # -- Safe distance (auto-compute from rover extent if not specified) --
-        if self.cfg.safe_distance is not None:
-            self._safe_distance = self.cfg.safe_distance
-        else:
-            # Compute max rover extent: distance from root to farthest body
-            # link, doubled to get full length. This gives a conservative
-            # estimate of the rover's physical size.
-            max_extent = 0.0
-            for aid in self.cfg.possible_agents:
-                robot = self._robots[aid]
-                body_pos = robot.data.body_pos_w[0]  # (num_bodies, 3)
-                root_pos = robot.data.root_pos_w[0]  # (3,)
-                extents = torch.norm(body_pos - root_pos, dim=-1)
-                max_extent = max(max_extent, extents.max().item() * 2.0)
-            self._safe_distance = max_extent
-            print(
-                f"[MarlWaypointTask] Auto safe_distance = {self._safe_distance:.3f} m"
-            )
-
-        # -- Ordered list of "other agents" per agent (for inter-rover obs) --
         self._other_agents = {
-            aid: [a for a in self.cfg.possible_agents if a != aid]
-            for aid in self.cfg.possible_agents
+            agent_id: [
+                other for other in self.cfg.possible_agents if other != agent_id
+            ]
+            for agent_id in self.cfg.possible_agents
         }
-        self._debug_action_metrics: dict[str, torch.Tensor] = {}
-        self._debug_termination_metrics: dict[str, torch.Tensor] = {}
+        self._target_marker = VisualizationMarkers(self.cfg.target_marker_cfg)
 
-    # --------------------------------------------------------------------- #
-    #  Reset                                                                  #
-    # --------------------------------------------------------------------- #
+        self._proximity_safe_distance = self._resolve_proximity_safe_distance()
 
-    def _sample_target_xy(self, n: int) -> torch.Tensor:
-        """Sample n target XY offsets in an annular region.
-
-        Samples uniformly by area within the annulus defined by
-        [target_spawn_min_radius, target_spawn_radius]. Targets are placed
-        at ground level (env_origins z).
-
-        Returns:
-            ``(n, 2)`` tensor of XY offsets from env origin.
-        """
-        r_min = self.cfg.target_spawn_min_radius
-        r_max = self.cfg.target_spawn_radius
-        # Uniform sampling by area: r = sqrt(U * (r_max² - r_min²) + r_min²)
-        u = torch.rand(n, device=self.device)
-        r = torch.sqrt(u * (r_max**2 - r_min**2) + r_min**2)
-        theta = torch.rand(n, device=self.device) * 2.0 * torch.pi
-        xy = torch.stack([r * torch.cos(theta), r * torch.sin(theta)], dim=-1)
-        return xy  # (n, 2)
+    # ------------------------------------------------------------------ #
+    # Reset and actions
+    # ------------------------------------------------------------------ #
 
     def _reset_idx(self, env_ids: Sequence[int]):
+        """Reset rover-local buffers, targets, and episodic observation noise."""
         super()._reset_idx(env_ids)
 
-        n = len(env_ids)
-        origins = self.scene.env_origins[env_ids]  # (n, 3)
-        explorer_ids = self.cfg.explorer_agents  # ["explorer_1", "explorer_2"]
+        origins = self.scene.env_origins[env_ids]
+        for agent_id in self.cfg.possible_agents:
+            goal = self._goals[agent_id]
+            goal[env_ids, :3] = origins
+            goal[env_ids, 3:7] = 0.0
+            goal[env_ids, 3] = 1.0
 
-        # -- Reset explorer targets with min separation constraint --
-        # Sample target 1
-        xy1 = self._sample_target_xy(n)  # (n, 2)
+            self._actions[agent_id][env_ids] = 0.0
+            self._previous_actions[agent_id][env_ids] = 0.0
+            self._episodic_yaw_noise[agent_id][env_ids] = (
+                torch.randn(len(env_ids), device=self.device)
+                * self.cfg.episodic_yaw_noise_std
+            )
 
-        # Sample target 2 with rejection sampling to enforce min separation
-        xy2 = self._sample_target_xy(n)  # (n, 2)
-        for attempt in range(100):
-            dist = torch.norm(xy1 - xy2, dim=-1)  # (n,)
-            too_close = dist < self.cfg.target_min_separation
-            if not too_close.any():
-                break
-            # Resample only the environments where targets are too close
-            m = too_close.sum().item()
-            xy2[too_close] = self._sample_target_xy(m)
-
-        # Assign targets (at ground level = env_origins z)
-        for i, aid in enumerate(explorer_ids):
-            xy = xy1 if i == 0 else xy2
-            self._goals[aid][env_ids, 0] = origins[:, 0] + xy[:, 0]
-            self._goals[aid][env_ids, 1] = origins[:, 1] + xy[:, 1]
-            self._goals[aid][env_ids, 2] = origins[:, 2]  # ground level
-
-            # Update visual target poses in simulation
-            target_obj = self.scene[f"target_{i+1}"]
-            target_pose = torch.zeros((len(env_ids), 7), device=self.device)
-            target_pose[:, :3] = self._goals[aid][env_ids]
-            target_pose[:, 2] += 1.5  # Hover 1.5m above ground
-            target_pose[:, 3:7] = torch.tensor(
-                [0.0, 0.0, 1.0, 0.0], device=self.device
-            )  # Rotate 180 deg (point down)
-            target_obj.write_root_pose_to_sim(target_pose, env_ids=env_ids)
-
-        # -- Reset flags and buffers --
-        for aid in self.cfg.explorer_agents:
-            self._explorer_reached[aid][env_ids] = False
-        for aid in self.cfg.possible_agents:
-            self._actions_dict[aid][env_ids] = 0.0
-            self._prev_actions_dict[aid][env_ids] = 0.0
-            self._rollover_count[aid][env_ids] = 0
-        for aid in self.cfg.explorer_agents:
-            pos_w = self._robots[aid].data.root_link_pose_w[env_ids, :3]
-            dist2d = torch.norm(pos_w[:, :2] - self._goals[aid][env_ids, :2], dim=-1)
-            self._prev_goal_distances[aid][env_ids] = dist2d
-            self._last_goal_distances[aid][env_ids] = dist2d
-
-    # --------------------------------------------------------------------- #
-    #  Actions                                                                #
-    # --------------------------------------------------------------------- #
+        for noise in self._episodic_xy_noise.values():
+            noise[env_ids] = (
+                torch.randn(len(env_ids), 2, device=self.device)
+                * self.cfg.episodic_xy_noise_std
+            )
 
     def _pre_physics_step(self, actions: dict[str, torch.Tensor]) -> None:
-        flat_parts = []
-        for aid in self.cfg.possible_agents:
-            act = actions[aid].to(self.device)
-            self._prev_actions_dict[aid][:] = self._actions_dict[aid]
-            self._actions_dict[aid][:] = act
-            flat_parts.append(act)
+        """Clamp normalized rover commands and send them to the drive terms."""
+        flat_actions = []
+        for agent_id in self.cfg.possible_agents:
+            action = actions[agent_id].to(self.device).clamp(-1.0, 1.0)
+            self._previous_actions[agent_id][:] = self._actions[agent_id]
+            self._actions[agent_id][:] = action
+            flat_actions.append(action)
 
-        self.action_manager.process_action(torch.cat(flat_parts, dim=-1))
-        self._update_action_debug_metrics()
-
-        if self.cfg.live_action_debug:
-            interval = max(1, int(self.cfg.live_action_debug_interval))
-            step = int(getattr(self, "common_step_counter", 0))
-            if step % interval == 0 and self.num_envs > 0:
-                env_idx = 0
-                print(
-                    f"[actions step={step} env={env_idx}] "
-                    f"{self._action_debug_payload(env_idx)}",
-                    flush=True,
-                )
+        self.action_manager.process_action(torch.cat(flat_actions, dim=-1))
 
     def _apply_action(self) -> None:
+        """Apply the Leo Rover linear and angular velocity commands."""
         self.action_manager.apply_action()
 
-    def _action_debug_payload(self, env_idx: int = 0) -> dict[str, dict[str, float]]:
-        payload = {}
-        for aid in self.cfg.possible_agents:
-            action = self._actions_dict[aid][env_idx]
-            entry = {
-                "raw_linear_velocity": float(action[0].item()),
-                "raw_angular_velocity": float(action[1].item()),
-            }
-            term = self._wheeled_drive_terms.get(aid)
-            processed_actions = getattr(term, "processed_actions", None)
-            if processed_actions is not None:
-                processed = processed_actions[env_idx]
-                entry["processed_linear_velocity"] = float(processed[0].item())
-                entry["processed_angular_velocity"] = float(processed[1].item())
-            payload[aid] = entry
-        return payload
+    # ------------------------------------------------------------------ #
+    # Observations and centralized state
+    # ------------------------------------------------------------------ #
 
-    def _update_action_debug_metrics(self) -> None:
-        if not self.cfg.debug_metrics:
-            self._debug_action_metrics = {}
-            return
+    @staticmethod
+    def _yaw_from_quat(quat: torch.Tensor) -> torch.Tensor:
+        """Return yaw from a wxyz quaternion tensor."""
+        rotmat = matrix_from_quat(quat)
+        return torch.atan2(rotmat[..., 1, 0], rotmat[..., 0, 0])
 
-        metrics = {}
-        for aid in self.cfg.possible_agents:
-            action = self._actions_dict[aid]
-            action_delta = action - self._prev_actions_dict[aid]
-            metrics[f"Debug / Action raw linear mean / {aid}"] = action[:, 0].mean()
-            metrics[f"Debug / Action raw angular mean / {aid}"] = action[:, 1].mean()
-            metrics[f"Debug / Action raw abs mean / {aid}"] = action.abs().mean()
-            metrics[f"Debug / Action rate mean / {aid}"] = (
-                action_delta.square().mean(dim=-1).mean()
-            )
+    @staticmethod
+    def _yaw_sin_cos(yaw: torch.Tensor) -> torch.Tensor:
+        """Encode a heading without the discontinuity at ±pi."""
+        return torch.stack((torch.sin(yaw), torch.cos(yaw)), dim=-1)
 
-            term = self._wheeled_drive_terms.get(aid)
-            processed_actions = getattr(term, "processed_actions", None)
-            if processed_actions is not None:
-                metrics[f"Debug / Command linear mean / {aid}"] = processed_actions[
-                    :, 0
-                ].mean()
-                metrics[f"Debug / Command angular mean / {aid}"] = processed_actions[
-                    :, 1
-                ].mean()
-                metrics[f"Debug / Command abs mean / {aid}"] = (
-                    processed_actions.abs().mean()
-                )
+    def _noisy_xy(
+        self, observer: str, entity: str, relative_xy: torch.Tensor
+    ) -> torch.Tensor:
+        """Add the configured episodic offset and fresh per-step XY noise."""
+        return (
+            relative_xy
+            + self._episodic_xy_noise[(observer, entity)]
+            + torch.randn_like(relative_xy) * self.cfg.per_step_xy_noise_std
+        )
 
-        self._debug_action_metrics = metrics
-
-    # --------------------------------------------------------------------- #
-    #  Terrain helper (shared by observations and state)                      #
-    # --------------------------------------------------------------------- #
-
-    def _get_terrain_features(self, agent_id: str) -> torch.Tensor:
-        """Relative terrain heights from the RayCaster grid.
-
-        Returns:
-            ``(num_envs, terrain_num_rays)`` tensor. Negative means
-            crater/below sensor, positive means hill/above sensor. NaN/inf
-            values are replaced with ``-2.0``.
-        """
-        rc = self._raycasters[agent_id]
-        sensor_z = rc.data.pos_w[:, 2:3]
-        hit_z = rc.data.ray_hits_w[..., 2]
-        heights = hit_z - sensor_z
-        return torch.nan_to_num(heights, nan=-2.0, posinf=-2.0, neginf=-2.0)
-
-    # --------------------------------------------------------------------- #
-    #  Observations  (per-agent, decentralized)                               #
-    # --------------------------------------------------------------------- #
+    def _visualize_targets(self) -> None:
+        """Display one virtual target marker per rover when rendering is active."""
+        target_poses = torch.cat(
+            [self._goals[agent_id] for agent_id in self.cfg.possible_agents], dim=0
+        )
+        self._target_marker.visualize(target_poses[:, :3], target_poses[:, 3:7])
 
     def _get_observations(self) -> dict[str, torch.Tensor]:
-        """Build local observations for each agent.
+        """Return each rover's decentralized noisy planar observation.
 
-        Layout::
-
-            task_xy             (2)  — explorer: rel XY to target; supporter: zeros
-            other_rover1_xy     (2)  — rel XY to first other rover  (body frame)
-            other_rover2_xy     (2)  — rel XY to second other rover (body frame)
-            lin_vel_b           (3)  — body-frame linear velocity
-            imu_lin_acc_b       (3)  — IMU linear acceleration (body frame)
-            imu_ang_vel_b       (3)  — IMU angular velocity (body frame)
-            projected_gravity_b (3)  — gravity direction in body frame
-            terrain             (terrain_num_rays) — RayCaster relative heights
+        The target-relative XY and yaw use the original SRB noise scales.  The
+        multi-agent extension applies independent XY noise to each directed
+        observer-to-other-rover measurement as well.
         """
-        obs = {}
-
-        # Pre-compute all rover world positions for inter-rover observations
-        all_pos_w = {
-            aid: self._robots[aid].data.root_link_pose_w[:, :3]
-            for aid in self.cfg.possible_agents
+        self._visualize_targets()
+        observations = {}
+        rover_positions = {
+            agent_id: self._robots[agent_id].data.root_link_pose_w[:, :3]
+            for agent_id in self.cfg.possible_agents
         }
 
-        # Identity quaternion (reused for targets/positions without orientation)
-        id_quat = torch.zeros(self.num_envs, 4, device=self.device)
-        id_quat[:, 0] = 1.0
+        for agent_id in self.cfg.possible_agents:
+            pose = self._robots[agent_id].data.root_link_pose_w
+            rover_pos, rover_quat = pose[:, :3], pose[:, 3:7]
+            goal = self._goals[agent_id]
+            target_pos_b, target_quat_b = subtract_frame_transforms(
+                t01=rover_pos,
+                q01=rover_quat,
+                t02=goal[:, :3],
+                q02=goal[:, 3:7],
+            )
+            noisy_target_xy = self._noisy_xy(
+                agent_id, "target", target_pos_b[:, :2]
+            )
+            target_yaw_b = self._yaw_from_quat(target_quat_b)
+            noisy_target_yaw = (
+                target_yaw_b
+                + self._episodic_yaw_noise[agent_id]
+                + torch.randn_like(target_yaw_b) * self.cfg.per_step_yaw_noise_std
+            )
+            parts = [noisy_target_xy, self._yaw_sin_cos(noisy_target_yaw)]
 
-        # Marker positions for batch visualization
-        marker_pos_list = []
-        marker_quat_list = []
-
-        for aid in self.cfg.possible_agents:
-            robot = self._robots[aid]
-            pose = robot.data.root_link_pose_w  # (N, 7)
-            ego_pos = pose[:, :3]
-            ego_quat = pose[:, 3:7]
-            imu = self._imus[aid]
-
-            parts = []
-
-            # ---- Task-relative XY (2 dims) ----
-            if aid in self.cfg.explorer_agents:
-                # Explorer: relative XY to own target in body frame
-                goal = self._goals[aid]
-                tf_pos, _ = subtract_frame_transforms(
-                    t01=ego_pos,
-                    q01=ego_quat,
-                    t02=goal,
-                    q02=id_quat,
+            for other_id in self._other_agents[agent_id]:
+                other_pos_b, _ = subtract_frame_transforms(
+                    t01=rover_pos,
+                    q01=rover_quat,
+                    t02=rover_positions[other_id],
                 )
-                parts.append(tf_pos[:, :2])  # (N, 2)
-                # Collect markers
-                marker_pos_list.append(goal)
-                marker_quat_list.append(id_quat)
-            else:
-                # Supporter: no target → zeros
-                parts.append(torch.zeros(self.num_envs, 2, device=self.device))
-
-            # ---- Other rovers relative XY (2 + 2 = 4 dims) ----
-            for other_aid in self._other_agents[aid]:
-                other_pos = all_pos_w[other_aid]
-                tf_pos, _ = subtract_frame_transforms(
-                    t01=ego_pos,
-                    q01=ego_quat,
-                    t02=other_pos,
-                    q02=id_quat,
+                parts.append(
+                    self._noisy_xy(agent_id, other_id, other_pos_b[:, :2])
                 )
-                parts.append(tf_pos[:, :2])  # (N, 2)
 
-            # ---- Body-frame linear velocity (3 dims) ----
-            # In deployment: estimated via sensor fusion (wheel odometry + IMU).
-            # In simulation: ground-truth from physics, following SRB convention.
-            parts.append(robot.data.root_lin_vel_b)  # (N, 3)
+            observations[agent_id] = torch.cat(parts, dim=-1)
 
-            # ---- IMU readings (3 + 3 + 3 = 9 dims) ----
-            parts.append(imu.data.lin_acc_b)  # (N, 3) linear acceleration
-            parts.append(imu.data.ang_vel_b)  # (N, 3) angular velocity
-            parts.append(imu.data.projected_gravity_b)  # (N, 3) gravity direction
-
-            # ---- Terrain features ----
-            parts.append(self._get_terrain_features(aid))
-
-            obs[aid] = torch.cat(parts, dim=-1)
-
-        return obs
-
-    # --------------------------------------------------------------------- #
-    #  Global State  (CTDE centralized critic)                                #
-    # --------------------------------------------------------------------- #
+        return observations
 
     def _get_states(self) -> torch.Tensor:
-        """Build the privileged global state vector.
+        """Return the compact unnoised planar CTDE state.
 
-        Layout (all in env-local frame, orientations as 6D continuous rep)::
-
-            Pose_supporter   (9)  = pos(3) + rot6d(6)
-            Pose_explorer_1  (9)
-            Pose_explorer_2  (9)
-            Vel_supporter    (6)  = lin_vel_w(3) + ang_vel_w(3)
-            Vel_explorer_1   (6)
-            Vel_explorer_2   (6)
-            Target_explorer_1(3)  = position relative to env_origin
-            Target_explorer_2(3)
-            Terrain_supporter  (terrain_num_rays)  = RayCaster relative heights
-            Terrain_explorer_1 (terrain_num_rays)
-            Terrain_explorer_2 (terrain_num_rays)
+        The state contains rover XY and heading sin/cos for every rover,
+        followed by the corresponding target XY and heading sin/cos.  It is a
+        privileged task state for a centralized critic, not the full physical
+        simulator state (which also includes velocities and target dynamics).
         """
         parts = []
-
-        # -- Poses: position (3) + 6D orientation (6) = 9 per rover --
-        for aid in self.cfg.possible_agents:
-            robot = self._robots[aid]
-            pos_w = robot.data.root_link_pose_w[:, :3]
-            quat_w = robot.data.root_link_pose_w[:, 3:7]
-            parts.append(pos_w - self.scene.env_origins)  # (N, 3)
-            parts.append(quat_to_rot6d(quat_w))  # (N, 6)
-
-        # -- Velocities: linear (3) + angular (3) = 6 per rover, world frame --
-        for aid in self.cfg.possible_agents:
-            robot = self._robots[aid]
-            parts.append(robot.data.root_lin_vel_w)  # (N, 3)
-            parts.append(robot.data.root_ang_vel_w)  # (N, 3)
-
-        # -- Explorer target positions, relative to env origin --
-        for aid in self.cfg.explorer_agents:
-            parts.append(self._goals[aid] - self.scene.env_origins)  # (N, 3)
-
-        # -- Terrain features --
-        for aid in self.cfg.possible_agents:
-            parts.append(self._get_terrain_features(aid))
-
+        for agent_id in self.cfg.possible_agents:
+            pose = self._robots[agent_id].data.root_link_pose_w
+            parts.extend(
+                (
+                    pose[:, :2] - self.scene.env_origins[:, :2],
+                    self._yaw_sin_cos(self._yaw_from_quat(pose[:, 3:7])),
+                )
+            )
+        for agent_id in self.cfg.possible_agents:
+            goal = self._goals[agent_id]
+            parts.extend(
+                (
+                    goal[:, :2] - self.scene.env_origins[:, :2],
+                    self._yaw_sin_cos(self._yaw_from_quat(goal[:, 3:7])),
+                )
+            )
         return torch.cat(parts, dim=-1)
 
-    # --------------------------------------------------------------------- #
-    #  Rewards  (Dec-POMDP: single shared reward for all agents)              #
-    # --------------------------------------------------------------------- #
+    # ------------------------------------------------------------------ #
+    # Shared reward
+    # ------------------------------------------------------------------ #
+
+    def _srb_reward(self, agent_id: str) -> torch.Tensor:
+        """Return one rover's unmodified six-term SRB reward.
+
+        This exactly preserves the constants and equations in the original
+        state-based waypoint task.
+        """
+        pose = self._robots[agent_id].data.root_link_pose_w
+        target_pos_b, target_quat_b = subtract_frame_transforms(
+            t01=pose[:, :3],
+            q01=pose[:, 3:7],
+            t02=self._goals[agent_id][:, :3],
+            q02=self._goals[agent_id][:, 3:7],
+        )
+        distance = torch.norm(target_pos_b[:, :2], dim=-1)
+        angle_to_target = torch.atan2(target_pos_b[:, 1], target_pos_b[:, 0])
+        target_yaw_b = self._yaw_from_quat(target_quat_b)
+        action_rate = (
+            self._actions[agent_id] - self._previous_actions[agent_id]
+        ).square().mean(dim=-1)
+
+        penalty_action_rate = -0.5 * action_rate
+        penalty_position_tracking = -torch.square(distance)
+        reward_point_towards_target = 1.0 - torch.tanh(
+            torch.abs(angle_to_target) / 0.7854
+        )
+        position_precision = 1.0 - torch.tanh(distance / 0.05)
+        reward_position_tracking_precision = 4.0 * position_precision
+        orientation_precision = position_precision * (
+            1.0 - torch.tanh(torch.abs(target_yaw_b) / 0.2618)
+        )
+        reward_orientation_tracking = 8.0 * orientation_precision
+        reward_action_rate_at_target = 32.0 * orientation_precision * (
+            1.0 - torch.tanh(action_rate / 0.1)
+        )
+
+        reward = (
+            penalty_action_rate
+            + penalty_position_tracking
+            + reward_point_towards_target
+            + reward_position_tracking_precision
+            + reward_orientation_tracking
+            + reward_action_rate_at_target
+        )
+        return reward
+
+    def _resolve_proximity_safe_distance(self) -> float:
+        """Use the configured threshold or infer a conservative rover length."""
+        if self.cfg.proximity_safe_distance is not None:
+            return self.cfg.proximity_safe_distance
+
+        max_extent = 0.0
+        for agent_id in self.cfg.possible_agents:
+            robot = self._robots[agent_id]
+            body_pos = robot.data.body_pos_w[0]
+            root_pos = robot.data.root_pos_w[0]
+            max_extent = max(
+                max_extent, torch.norm(body_pos - root_pos, dim=-1).max().item() * 2.0
+            )
+        return max(max_extent, 1.0e-6)
+
+    def _mean_proximity_penalty(self) -> torch.Tensor:
+        """Return mean XY proximity penalty, or zero for a single rover."""
+        if len(self.cfg.possible_agents) < 2:
+            return torch.zeros(self.num_envs, device=self.device)
+
+        positions = [
+            self._robots[agent_id].data.root_link_pose_w[:, :2]
+            for agent_id in self.cfg.possible_agents
+        ]
+        penalties = []
+        for first in range(len(positions)):
+            for second in range(first + 1, len(positions)):
+                distance = torch.norm(positions[first] - positions[second], dim=-1)
+                penalties.append(
+                    torch.clamp(
+                        1.0 - distance / self._proximity_safe_distance, min=0.0
+                    )
+                )
+        return torch.stack(penalties, dim=-1).mean(dim=-1)
 
     def _get_rewards(self) -> dict[str, torch.Tensor]:
-        """Compute the shared Dec-POMDP reward.
+        """Return the same mean-SRB team reward to every rover.
 
-        All agents receive the **exact same scalar**::
-
-            R = w_progress * mean(-explorer_goal_distance / target_spawn_radius)
-              + w_goal     * (reached_exp1 + reached_exp2) / 2
-              - w_proximity * mean(proximity_penalty over all rover pairs)
-              - w_action    * mean(action_rate over all agents)
+        ``w_proximity`` defaults to zero, so it does not change the baseline
+        task.  When enabled, it subtracts a normalized pairwise XY penalty from
+        the common reward and is the sole multi-agent-specific reward term.
         """
-        # ---- Explorer progress ----
-        progress_terms = []
-        distance_terms = {}
-        distance_delta_terms = {}
-        distance_scale = max(float(self.cfg.target_spawn_radius), 1.0e-6)
-        for aid in self.cfg.explorer_agents:
-            pos_w = self._robots[aid].data.root_link_pose_w[:, :3]
-            dist2d = torch.norm(pos_w[:, :2] - self._goals[aid][:, :2], dim=-1)
-            distance_terms[aid] = dist2d
-            distance_delta_terms[aid] = self._prev_goal_distances[aid] - dist2d
-            progress_terms.append(-dist2d / distance_scale)
-            # Update reached flags
-            self._explorer_reached[aid] = dist2d < self.cfg.goal_reached_threshold
-            self._last_goal_distances[aid] = dist2d
+        individual_rewards = []
+        for agent_id in self.cfg.possible_agents:
+            individual_rewards.append(self._srb_reward(agent_id))
 
-        mean_progress = torch.stack(progress_terms, dim=-1).mean(dim=-1)  # (N,)
-        mean_distance_delta = torch.stack(
-            [distance_delta_terms[aid] for aid in self.cfg.explorer_agents], dim=-1
-        ).mean(dim=-1)
+        shared_reward = torch.stack(individual_rewards, dim=-1).mean(dim=-1)
+        shared_reward -= self.cfg.w_proximity * self._mean_proximity_penalty()
+        return {agent_id: shared_reward for agent_id in self.cfg.possible_agents}
 
-        # ---- Goal-reached bonus (per explorer, averaged) ----
-        reached_count = torch.zeros(self.num_envs, device=self.device)
-        for aid in self.cfg.explorer_agents:
-            reached_count += self._explorer_reached[aid].float()
-        goal_bonus = reached_count / len(self.cfg.explorer_agents)  # (N,)
-
-        # ---- Proximity penalty (over all 3 rover pairs) ----
-        all_pos = [
-            self._robots[aid].data.root_link_pose_w[:, :3]
-            for aid in self.cfg.possible_agents
-        ]
-        pair_penalties = []
-        for i in range(len(all_pos)):
-            for j in range(i + 1, len(all_pos)):
-                dist = torch.norm(all_pos[i] - all_pos[j], dim=-1)
-                penalty = torch.clamp(1.0 - dist / self._safe_distance, min=0.0)
-                pair_penalties.append(penalty)
-        mean_proximity = torch.stack(pair_penalties, dim=-1).mean(dim=-1)  # (N,)
-
-        # ---- Action-rate penalty (all agents, averaged) ----
-        action_rates = []
-        action_rate_terms = {}
-        for aid in self.cfg.possible_agents:
-            diff = (self._actions_dict[aid] - self._prev_actions_dict[aid]).square()
-            action_rate = diff.mean(dim=-1)
-            action_rate_terms[aid] = action_rate
-            action_rates.append(action_rate)
-        mean_action_rate = torch.stack(action_rates, dim=-1).mean(dim=-1)  # (N,)
-
-        # ---- Shared reward ----
-        shared_reward = (
-            self.cfg.w_progress * mean_progress
-            + self.cfg.w_goal * goal_bonus
-            - self.cfg.w_proximity * mean_proximity
-            - self.cfg.w_action * mean_action_rate
-        )
-
-        self._update_episode_debug_metrics(
-            distance_terms=distance_terms,
-            distance_delta_terms=distance_delta_terms,
-            action_rate_terms=action_rate_terms,
-            mean_progress=mean_progress,
-            mean_distance_delta=mean_distance_delta,
-            goal_bonus=goal_bonus,
-            mean_proximity=mean_proximity,
-            mean_action_rate=mean_action_rate,
-            shared_reward=shared_reward,
-        )
-
-        if self.cfg.live_reward_debug:
-            interval = max(1, int(self.cfg.live_reward_debug_interval))
-            step = int(getattr(self, "common_step_counter", 0))
-            if step % interval == 0 and self.num_envs > 0:
-                env_idx = 0
-                progress = self.cfg.w_progress * mean_progress[env_idx]
-                goal = self.cfg.w_goal * goal_bonus[env_idx]
-                proximity = -self.cfg.w_proximity * mean_proximity[env_idx]
-                action = -self.cfg.w_action * mean_action_rate[env_idx]
-                reached = {
-                    aid: bool(self._explorer_reached[aid][env_idx].item())
-                    for aid in self.cfg.explorer_agents
-                }
-                print(
-                    "[reward "
-                    f"step={step} env={env_idx}] "
-                    f"total={shared_reward[env_idx].item():+.4f} "
-                    f"progress={progress.item():+.4f} "
-                    f"goal={goal.item():+.4f} "
-                    f"proximity={proximity.item():+.4f} "
-                    f"action={action.item():+.4f} "
-                    f"reached={reached}",
-                    flush=True,
-                )
-
-        # Dec-POMDP: every agent gets the same reward
-        for aid in self.cfg.explorer_agents:
-            self._prev_goal_distances[aid] = distance_terms[aid]
-
-        return {aid: shared_reward for aid in self.cfg.possible_agents}
-
-    def _update_episode_debug_metrics(
-        self,
-        *,
-        distance_terms: dict[str, torch.Tensor],
-        distance_delta_terms: dict[str, torch.Tensor],
-        action_rate_terms: dict[str, torch.Tensor],
-        mean_progress: torch.Tensor,
-        mean_distance_delta: torch.Tensor,
-        goal_bonus: torch.Tensor,
-        mean_proximity: torch.Tensor,
-        mean_action_rate: torch.Tensor,
-        shared_reward: torch.Tensor,
-    ) -> None:
-        if not self.cfg.debug_metrics:
-            self.extras.pop("episode", None)
-            self.extras.pop("log", None)
-            return
-
-        metrics = {
-            **self._debug_action_metrics,
-            **self._debug_termination_metrics,
-            "Debug / Goal distance mean / explorers": torch.stack(
-                [distance_terms[aid] for aid in self.cfg.explorer_agents], dim=-1
-            ).mean(),
-            "Debug / Goal delta distance mean / explorers": mean_distance_delta.mean(),
-            "Debug / Goal reached rate / explorers": goal_bonus.mean(),
-            "RewardComponents / progress raw mean": mean_progress.mean(),
-            "RewardComponents / progress weighted mean": (
-                self.cfg.w_progress * mean_progress
-            ).mean(),
-            "RewardComponents / goal raw mean": goal_bonus.mean(),
-            "RewardComponents / goal weighted mean": (
-                self.cfg.w_goal * goal_bonus
-            ).mean(),
-            "RewardComponents / proximity raw mean": mean_proximity.mean(),
-            "RewardComponents / proximity weighted mean": (
-                -self.cfg.w_proximity * mean_proximity
-            ).mean(),
-            "RewardComponents / action raw mean": mean_action_rate.mean(),
-            "RewardComponents / action weighted mean": (
-                -self.cfg.w_action * mean_action_rate
-            ).mean(),
-            "RewardComponents / shared reward mean": shared_reward.mean(),
-            "Episode / active length mean": self.episode_length_buf.float().mean(),
-        }
-
-        for aid in self.cfg.possible_agents:
-            robot = self._robots[aid]
-            speed_xy = torch.norm(robot.data.root_lin_vel_b[:, :2], dim=-1)
-            metrics[f"Debug / Speed xy mean / {aid}"] = speed_xy.mean()
-            metrics[f"Debug / Speed xy max / {aid}"] = speed_xy.max()
-            metrics[f"Debug / Action rate reward source / {aid}"] = action_rate_terms[
-                aid
-            ].mean()
-
-        for aid in self.cfg.explorer_agents:
-            metrics[f"Debug / Goal distance mean / {aid}"] = distance_terms[aid].mean()
-            metrics[f"Debug / Goal distance min / {aid}"] = distance_terms[aid].min()
-            metrics[f"Debug / Goal delta distance mean / {aid}"] = distance_delta_terms[
-                aid
-            ].mean()
-            metrics[f"Debug / Goal reached rate / {aid}"] = (
-                self._explorer_reached[aid].float().mean()
-            )
-
-        debug_info = {
-            key: value.detach() if isinstance(value, torch.Tensor) else value
-            for key, value in metrics.items()
-        }
-        self.extras["episode"] = debug_info
-        self.extras["log"] = debug_info
-
-    # --------------------------------------------------------------------- #
-    #  Termination / Truncation                                               #
-    # --------------------------------------------------------------------- #
+    # ------------------------------------------------------------------ #
+    # Termination
+    # ------------------------------------------------------------------ #
 
     def _get_dones(self) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
-        """Terminate on joint goal-reach or rollover.
-
-        Rollover detection uses projected gravity from the IMU. The tilt
-        must persist for ``rollover_debounce_steps`` consecutive timesteps
-        to avoid termination on transient bounces.
-        """
-        # ---- Success: both explorers reached their targets ----
-        both_reached = torch.ones(
-            self.num_envs,
-            dtype=torch.bool,
-            device=self.device,
-        )
-        for aid in self.cfg.explorer_agents:
-            both_reached &= self._explorer_reached[aid]
-
-        # ---- Rollover: any rover tilted beyond threshold ----
-        any_rolled = torch.zeros(
-            self.num_envs,
-            dtype=torch.bool,
-            device=self.device,
-        )
-        for aid in self.cfg.possible_agents:
-            imu = self._imus[aid]
-            grav_b = imu.data.projected_gravity_b  # (N, 3)
-            # tilt_angle = angle between body Z-axis and world "down"
-            # When upright: grav_b[:, 2] ≈ -1 → acos(1) = 0
-            # When tilted:  grav_b[:, 2] → 0  → acos(0) ≈ π/2
-            tilt = torch.acos(torch.clamp(-grav_b[:, 2], -1.0, 1.0))
-            tilted = tilt > self.cfg.rollover_threshold_rad
-
-            # Debounce: increment counter if tilted, reset if not
-            self._rollover_count[aid] = torch.where(
-                tilted,
-                self._rollover_count[aid] + 1,
-                torch.zeros_like(self._rollover_count[aid]),
-            )
-            any_rolled |= self._rollover_count[aid] >= self.cfg.rollover_debounce_steps
-
-        # Combined termination
-        terminated = both_reached | any_rolled
-
-        # Shared signal — all agents end together
-        termination = {aid: terminated for aid in self.cfg.possible_agents}
-
-        # Time-based truncation (only if not already terminated)
+        """Terminate only through the SRB task's configured time limit."""
+        terminated = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         time_out = self.episode_length_buf >= self.max_episode_length
-        time_out_not_terminated = time_out & ~terminated
-        done = terminated | time_out_not_terminated
-        done_count = done.float().sum()
-        truncation = {aid: time_out_not_terminated for aid in self.cfg.possible_agents}
-
-        self._debug_termination_metrics = {
-            "Termination / done count": done_count,
-            "Termination / success count": (both_reached & done).float().sum(),
-            "Termination / rollover count": (any_rolled & done).float().sum(),
-            "Termination / timeout count": time_out_not_terminated.float().sum(),
-            "Termination / success rate current": (both_reached & done).float().sum()
-            / torch.clamp(done_count, min=1.0),
-            "Termination / rollover rate current": (any_rolled & done).float().sum()
-            / torch.clamp(done_count, min=1.0),
-            "Termination / timeout rate current": time_out_not_terminated.float().sum()
-            / torch.clamp(done_count, min=1.0),
-        }
-
-        return termination, truncation
+        return (
+            {agent_id: terminated for agent_id in self.cfg.possible_agents},
+            {agent_id: time_out for agent_id in self.cfg.possible_agents},
+        )
