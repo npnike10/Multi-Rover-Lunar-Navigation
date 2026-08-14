@@ -7,11 +7,11 @@ SRB's state-based single-rover waypoint-navigation task.  Every rover has an
 individual moving planar waypoint.  It receives a decentralized noisy
 observation and the same scalar team reward as every other rover.
 
-The rover dictionary defines the agents.  The default contains three Leo
-rovers (`rover_1`, `rover_2`, and `rover_3`); setting the dictionary to one Leo
-rover creates the single-agent replication configuration.  There are no
-supporter/explorer roles, RayCaster terrain features, IMU features, rollover
-logic, or goal-completion termination.
+`num_rovers` defines the homogeneous Leo team.  Its default is `3`, producing
+`rover_1`, `rover_2`, and `rover_3`; set `env.num_rovers=1` to create the
+single-agent replication configuration.  There are no supporter/explorer
+roles, RayCaster terrain features, IMU features, rollover logic, or
+goal-completion termination.
 
 ## World, reset, and target dynamics
 
@@ -109,6 +109,6 @@ shared average rather than independent rewards.
   requested 0.4 m/s and 60°/s action mapping is preserved.
 - The target-relative target yaw is an orientation error, not the heading from
   rover to target.  Both are used separately by the SRB reward.
-- Changing the number of `robots` changes the agent set and the local/state
-  dimensions.  Policies and critics trained with one team size are therefore
-  not shape-compatible with another.
+- Changing the number of rovers changes the agent set and the local/state
+  dimensions.  Use `env.num_rovers=<N>` to change it; policies and critics
+  trained with one team size are not shape-compatible with another.

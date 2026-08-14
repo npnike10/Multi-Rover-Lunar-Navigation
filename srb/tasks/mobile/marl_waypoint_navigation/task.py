@@ -59,9 +59,10 @@ class MarlWaypointEventCfg(GroundMarlEventCfg):
 class MarlWaypointTaskCfg(GroundMarlEnvCfg):
     """Configuration for SRB-compatible multi-agent waypoint navigation.
 
-    The default configuration has three identical Leo rovers.  The rover
-    dictionary is the sole source of agent identities, so a one-rover
-    configuration is supported without a separate task class.
+    The default configuration has three identical Leo rovers.  Set
+    ``num_rovers=1`` to create the one-rover SRB-replication configuration;
+    rover identities are then generated as ``rover_1`` through
+    ``rover_<num_rovers>``.
 
     The procedural scenery is intentionally left as ``AssetVariant.PROCEDURAL``.
     With the Moon domain and 32 m spacing, SRB resolves it to its default
@@ -79,6 +80,7 @@ class MarlWaypointTaskCfg(GroundMarlEnvCfg):
     # LeoRover maps normalized [linear, angular] actions to 0.4 m/s and
     # 60 deg/s respectively.  Use this robot for replication of the requested
     # action bounds and scaling.
+    num_rovers: int = 3
     robots = {
         "rover_1": assets.LeoRover(),
         "rover_2": assets.LeoRover(),
@@ -147,9 +149,19 @@ class MarlWaypointTaskCfg(GroundMarlEnvCfg):
         return 8 * len(self.robots)
 
     def __post_init__(self):
+        if self.num_rovers < 1:
+            raise ValueError(
+                f"num_rovers must be at least 1. Received: {self.num_rovers}."
+            )
+
+        # All agents in this task are homogeneous Leo waypoint navigators.
+        # Rebuild the mapping from the public ``num_rovers`` override before
+        # the base configuration creates scene assets and action terms.
+        self.robots = {
+            f"rover_{index + 1}": assets.LeoRover()
+            for index in range(self.num_rovers)
+        }
         agent_ids = list(self.robots.keys())
-        if not agent_ids:
-            raise ValueError("MarlWaypointTaskCfg.robots must contain at least one rover.")
 
         # The target events must exist before the base configuration builds its
         # event manager.  ``spacing`` may be supplied explicitly; otherwise it

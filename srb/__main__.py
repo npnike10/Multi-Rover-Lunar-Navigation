@@ -339,21 +339,17 @@ def random_agent(
         while sim_app.is_running():
             if hasattr(env.unwrapped, "possible_agents"):
                 actions = {
-                    "supporter": torch.tensor(
-                        2 * torch.rand(1, 2) - 1,
+                    agent_id: torch.rand(
+                        (
+                            env.unwrapped.num_envs,
+                            *env.unwrapped.action_spaces[agent_id].shape,
+                        ),
                         dtype=torch.float32,
                         device=env.unwrapped.device,
-                    ),
-                    "explorer_1": torch.tensor(
-                        2 * torch.rand(1, 2) - 1,
-                        dtype=torch.float32,
-                        device=env.unwrapped.device,
-                    ),
-                    "explorer_2": torch.tensor(
-                        2 * torch.rand(1, 2) - 1,
-                        dtype=torch.float32,
-                        device=env.unwrapped.device,
-                    ),
+                    )
+                    * 2.0
+                    - 1.0
+                    for agent_id in env.unwrapped.possible_agents
                 }
                 observations, rewards, terminated, truncated, info = env.step(actions)
                 logging.trace(
@@ -390,18 +386,15 @@ def zero_agent(
 
     if hasattr(env.unwrapped, "possible_agents"):
         zero_actions = {
-            "supporter": torch.tensor(
-                [[0, 0.0]], dtype=torch.float32, device=env.unwrapped.device
-            ),
-            "explorer_1": torch.tensor(
-                [[0, 0.0]], dtype=torch.float32, device=env.unwrapped.device
-            ),
-            "explorer_2": torch.tensor(
-                [[0, 0.0]], dtype=torch.float32, device=env.unwrapped.device
-            ),
-        }
-        actions = {
-            agent: zero_actions[agent] for agent in env.unwrapped.possible_agents
+            agent_id: torch.zeros(
+                (
+                    env.unwrapped.num_envs,
+                    *env.unwrapped.action_spaces[agent_id].shape,
+                ),
+                dtype=torch.float32,
+                device=env.unwrapped.device,
+            )
+            for agent_id in env.unwrapped.possible_agents
         }
     else:
         action = torch.zeros(env.action_space.shape, device=env.unwrapped.device)  # type: ignore

@@ -34,10 +34,33 @@ def make_env():
     return env, observation
 
 
+def test_one_rover_configuration():
+    """Verify the public one-rover override without launching another scene."""
+    print("\n" + "=" * 60)
+    print("TEST 1: One-Rover Configuration")
+    print("=" * 60)
+
+    config = MarlWaypointTaskCfg(num_rovers=1)
+    passed = (
+        config.possible_agents == ["rover_1"]
+        and list(config.robots) == ["rover_1"]
+        and config.local_observation_dim == 4
+        and config.global_state_dim == 8
+        and hasattr(config.events, "target_rover_1_pose_evolution")
+    )
+    print(f"  agents={config.possible_agents}")
+    print(
+        "  dimensions: "
+        f"observation={config.local_observation_dim}, state={config.global_state_dim}"
+    )
+    print(f"  RESULT: {'PASSED' if passed else 'FAILED'}")
+    return passed
+
+
 def test_spaces(env, observation):
     """Verify the dynamic observation, state, and bounded action spaces."""
     print("\n" + "=" * 60)
-    print("TEST 1: Space Verification")
+    print("TEST 2: Space Verification")
     print("=" * 60)
 
     unwrapped = env.unwrapped
@@ -68,7 +91,7 @@ def test_spaces(env, observation):
 def test_observation_state_finiteness(env, observation):
     """Check that noisy observations and unnoised state are finite."""
     print("\n" + "=" * 60)
-    print("TEST 2: Observation and State Finiteness")
+    print("TEST 3: Observation and State Finiteness")
     print("=" * 60)
 
     unwrapped = env.unwrapped
@@ -98,7 +121,7 @@ def zero_actions(unwrapped):
 def test_shared_reward_aggregation(env):
     """Verify all agents receive the mean of the unmodified SRB rewards."""
     print("\n" + "=" * 60)
-    print("TEST 3: Shared SRB Reward Aggregation")
+    print("TEST 4: Shared SRB Reward Aggregation")
     print("=" * 60)
 
     unwrapped = env.unwrapped
@@ -125,7 +148,7 @@ def test_shared_reward_aggregation(env):
 def test_noise_and_proximity_configuration(env):
     """Validate reset-persistent noise buffers and configurable safe distance."""
     print("\n" + "=" * 60)
-    print("TEST 4: Noise and Proximity Configuration")
+    print("TEST 5: Noise and Proximity Configuration")
     print("=" * 60)
 
     unwrapped = env.unwrapped
@@ -155,7 +178,7 @@ def test_noise_and_proximity_configuration(env):
 def test_target_motion_and_bounds(env):
     """Verify that every virtual target evolves within the configured bounds."""
     print("\n" + "=" * 60)
-    print("TEST 5: Target Motion and Bounds")
+    print("TEST 6: Target Motion and Bounds")
     print("=" * 60)
 
     unwrapped = env.unwrapped
@@ -190,7 +213,7 @@ def test_target_motion_and_bounds(env):
 def test_multi_step_stability(env):
     """Run a short rollout and reject non-finite task outputs."""
     print("\n" + "=" * 60)
-    print("TEST 6: Multi-Step Stability")
+    print("TEST 7: Multi-Step Stability")
     print("=" * 60)
 
     unwrapped = env.unwrapped
@@ -218,6 +241,7 @@ print("#" * 60)
 
 environment, initial_observation = make_env()
 results = {
+    "one_rover_config": test_one_rover_configuration(),
     "spaces": test_spaces(environment, initial_observation),
     "finiteness": test_observation_state_finiteness(environment, initial_observation),
     "reward": test_shared_reward_aggregation(environment),
