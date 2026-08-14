@@ -16,8 +16,7 @@ goal-completion termination.
 ## World, reset, and target dynamics
 
 - The task uses SRB's Moon-domain `AssetVariant.PROCEDURAL` scenery.  At the
-  default 32 m spacing, this resolves to the default procedural `MoonSurface`
-  rather than the previous MARL-specific terrain override.
+  default 32 m spacing, this resolves to the default procedural `MoonSurface`.
 - A one-rover run uses SRB's original reset ranges: XY in `[-0.5, 0.5]` m,
   root height in `[0.4, 0.6]` m, yaw in `[-π, π]`, and the original initial
   velocity ranges.  Multi-rover runs retain those height, yaw, and velocity
@@ -112,3 +111,28 @@ shared average rather than independent rewards.
 - Changing the number of rovers changes the agent set and the local/state
   dimensions.  Use `env.num_rovers=<N>` to change it; policies and critics
   trained with one team size are not shape-compatible with another.
+
+## Three-rover MAPPO baseline
+
+Use `skrl_mappo` with the default `env.num_rovers=3`.  SRB's `MAPPO_RNN`
+extension shares one decentralized policy and one centralized critic across
+the three homogeneous rovers. Both networks receive an internal one-hot rover
+ID: the policy receives its 8-D local observation plus that ID, and the critic
+receives the common `24`-D state plus that ID. Each rover keeps a separate
+recurrent rollout state and memory buffer, while one optimizer aggregates all
+three rovers' losses into shared parameters. Its configuration matches the
+single-rover PPO-RNN baseline wherever
+the algorithms overlap: 128-step rollouts, 1024 samples per-rover minibatches,
+16 PPO epochs, `γ=0.997`, `λ=0.95`, linear `1e-4 → 0` learning rate, clip
+range `0.2`, entropy coefficient `0.01`, gradient norm `0.5`, and `[384, 384]`
+ELU MLP heads and a 384-unit LSTM. Stock SKRL MAPPO is feed-forward and does
+not implement cross-agent parameter sharing; this task uses SRB's extension.
+
+Because SKRL owns one 128-step rollout buffer per rover, the 1024 minibatch is
+defined per rover rather than across all three buffers.  Choose
+`env.num_envs=8` or another multiple of eight.  For example:
+
+```bash
+srb agent train --headless --algo skrl_mappo -e marl_waypoint_navigation \
+  env.num_rovers=3 env.num_envs=8
+```

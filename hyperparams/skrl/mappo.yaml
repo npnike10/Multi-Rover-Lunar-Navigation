@@ -1,54 +1,71 @@
-# https://skrl.readthedocs.io/en/latest/api/utils/model_instantiators.html
+# Three-rover waypoint-navigation MAPPO configuration.
+#
+# This matches the PPO-RNN paper settings wherever MAPPO has an equivalent:
+# 128-step rollout, 1024 samples per agent per minibatch, 16 learning epochs,
+# gamma=0.997, lambda=0.95, 1e-4 linearly annealed learning rate, PPO clip 0.2,
+# entropy coefficient 0.01, and gradient clipping at 0.5. The installed SKRL
+# release has no recurrent MAPPO, so SRB provides ``MAPPO_RNN``.
+
+# SRB's MAPPO_RNN shares one LSTM policy and one LSTM centralized critic across
+# the homogeneous rover team. Both receive an internal one-hot rover ID; this
+# preserves sharing while allowing role-index-dependent behavior if useful.
+# Rollout memory remains separate per rover because recurrent state is local.
 models:
-  separate: True
   policy:
-    class: GaussianMixin
-    clip_actions: False
-    clip_log_std: True
-    min_log_std: -20.0
-    max_log_std: 2.0
-    initial_log_std: -2.0
-    network:
-      - name: net
-        input: STATES
-        layers: [256, 256, 256]
-        activations: elu
-    output: ACTIONS
+    lstm_hidden_size: 384
+    mlp_units: [384, 384]
   value:
-    class: DeterministicMixin
-    clip_actions: False
-    network:
-      - name: net
-        input: STATES
-        layers: [256, 256, 256]
-        activations: elu
-    output: ONE
+    lstm_hidden_size: 384
+    mlp_units: [384, 384]
 
 # https://skrl.readthedocs.io/en/latest/api/memories/random.html
 memory:
   class: RandomMemory
-  # skrl MAPPO samples the full memory buffer on update, so keep this in sync
-  # with agent.rollouts to avoid training on stale or uncollected rows.
-  memory_size: 64
+  # Each rover owns a separate buffer. Keep this synchronized with rollouts.
+  memory_size: 128
 
 # https://skrl.readthedocs.io/en/latest/api/agents/mappo.html
 agent:
-  class: MAPPO
-  rollouts: 64
-  
-  # Standardizing states and values is common for MAPPO
+  class: MAPPO_RNN
+  rollouts: 128
+  # Converted at runtime to SKRL's ``mini_batches`` count using
+  # ``rollouts * env.num_envs`` for each rover's separate buffer. Thus this
+  # requires 128 * env.num_envs to be a multiple of 1024 (e.g. 8, 16, 32...).
+  minibatch_size: 1024
+  mini_batches: 1
+  learning_epochs: 16
+  discount_factor: 0.997
+  lambda: 0.95
+  learning_rate: 1.0e-4
+  learning_rate_scheduler: linear_to_zero
+  learning_rate_scheduler_kwargs: {}
+
+  # MAPPO adds a running scaler for the centralized critic input, in addition
+  # to the policy-observation and value scalers used by PPO-RNN.
   state_preprocessor: RunningStandardScaler
   state_preprocessor_kwargs: null
   shared_state_preprocessor: RunningStandardScaler
   shared_state_preprocessor_kwargs: null
   value_preprocessor: RunningStandardScaler
   value_preprocessor_kwargs: null
-  
+  random_timesteps: 0
+  learning_starts: 0
+  grad_norm_clip: 0.5
+  ratio_clip: 0.2
+  value_clip: 0.2
+  clip_predicted_values: False
+  entropy_loss_scale: 0.01
+  value_loss_scale: 0.5
+  kl_threshold: 0.0
+  rewards_shaper_scale: 1.0
+  time_limit_bootstrap: False
+  mixed_precision: False
+
   experiment:
     directory: "MISSING"
     experiment_name: "MISSING"
     write_interval: auto
-    checkpoint_interval: 100000
+    checkpoint_interval: 1000
     wandb: True
     wandb_kwargs:
       project: "Multi-Rover-Lunar-Navigation"
@@ -59,4 +76,4 @@ trainer:
   class: SequentialTrainer
   timesteps: 50000000
   environment_info: log
-  stochastic_evaluation: True
+  stochastic_evaluation: False

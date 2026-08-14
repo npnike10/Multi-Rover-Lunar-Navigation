@@ -274,6 +274,190 @@ def _configure_ppo_rnn_hyperparameters(
         }
 
 
+def _configure_mappo_hyperparameters(
+    agent_cfg: dict, env: Any, workflow: Literal["train", "eval"]
+) -> None:
+    """Translate paper-facing MAPPO settings to SKRL's per-agent fields.
+
+    SKRL MAPPO owns an independent rollout memory for every rover. Therefore
+    its minibatch size is defined per rover as ``rollouts * env.num_envs``, not
+    across the combined set of rover buffers. The centralized critic state is
+    supplied separately by the MAPPO runner path.
+    """
+    config = agent_cfg.get("agent", {})
+    if config.get("class", "").lower() not in {"mappo", "mappo_rnn"}:
+        return
+
+    minibatch_size = config.pop("minibatch_size", None)
+    if workflow == "eval":
+        # Evaluation never updates a MAPPO policy, so batch partitioning and
+        # the training-only scheduler must not constrain its environment count.
+        config["learning_rate_scheduler"] = None
+        config["learning_rate_scheduler_kwargs"] = {}
+        return
+
+    if minibatch_size is not None:
+        rollout_samples = config["rollouts"] * env.num_envs
+        if rollout_samples < minibatch_size or rollout_samples % minibatch_size:
+            raise ValueError(
+                "MAPPO requires rollouts * env.num_envs to be an exact multiple "
+                "of minibatch_size for each rover buffer. Received "
+                f"{config['rollouts']} * {env.num_envs} = {rollout_samples} "
+                f"samples and minibatch_size={minibatch_size}."
+            )
+        config["mini_batches"] = rollout_samples // minibatch_size
+
+    if config.get("learning_rate_scheduler") == "linear_to_zero":
+        import torch
+
+        rollouts = config["rollouts"]
+        epochs = config["learning_epochs"]
+        timesteps = agent_cfg["trainer"]["timesteps"]
+        scheduler_steps = ((timesteps + rollouts - 1) // rollouts) * epochs
+        # MAPPO's configuration values are expanded per agent by SKRL. Its
+        # kwargs must therefore be keyed by rover ID as well (a bare
+        # ``{"lr_lambda": ...}`` mapping is interpreted as an invalid agent map).
+        possible_agents = list(env.possible_agents)
+        config["learning_rate_scheduler"] = {
+            uid: torch.optim.lr_scheduler.LambdaLR for uid in possible_agents
+        }
+        config["learning_rate_scheduler_kwargs"] = {
+            uid: {"lr_lambda": lambda step: max(0.0, 1.0 - step / scheduler_steps)}
+            for uid in possible_agents
+        }
+
+
+def _install_mappo_rnn_runner_support() -> None:
+    """Add recurrent, parameter-shared MAPPO support to SKRL's Torch runner.
+
+    The installed SKRL package has only feed-forward MAPPO and creates one
+    optimizer per agent. ``MAPPO_RNN`` is an SRB extension: it shares one LSTM
+    policy and one LSTM centralized critic across the homogeneous rover team,
+    while providing an internal one-hot rover identity to both networks.
+    """
+    from skrl.utils.runner.torch import Runner
+
+    if getattr(Runner, "_srb_mappo_rnn_support", False):
+        return
+
+    original_generate_models = Runner._generate_models
+    original_generate_agent = Runner._generate_agent
+
+    def generate_models(self, env, cfg):
+        if cfg.get("agent", {}).get("class", "").lower() != "mappo_rnn":
+            return original_generate_models(self, env, cfg)
+
+        from srb.integrations.skrl.mappo_rnn import (
+            RecurrentSharedPolicy,
+            RecurrentSharedValue,
+        )
+
+        possible_agents = list(env.possible_agents)
+        if len(possible_agents) < 2:
+            raise ValueError("MAPPO_RNN requires at least two rovers.")
+        observation_space = env.observation_spaces[possible_agents[0]]
+        action_space = env.action_spaces[possible_agents[0]]
+        state_space = env.state_spaces[possible_agents[0]]
+        models_cfg = cfg.get("models", {})
+        policy_cfg = models_cfg.get("policy", {})
+        value_cfg = models_cfg.get("value", {})
+        hidden_size = policy_cfg.get("lstm_hidden_size", 384)
+        mlp_units = policy_cfg.get("mlp_units", [384, 384])
+        if (
+            hidden_size != value_cfg.get("lstm_hidden_size", hidden_size)
+            or mlp_units != value_cfg.get("mlp_units", mlp_units)
+        ):
+            raise ValueError(
+                "MAPPO_RNN requires matching policy and value LSTM/MLP dimensions."
+            )
+
+        policy = RecurrentSharedPolicy(
+            observation_space,
+            action_space,
+            env.device,
+            num_agents=len(possible_agents),
+            num_envs=env.num_envs,
+            hidden_size=hidden_size,
+            mlp_units=mlp_units,
+            sequence_length=cfg["agent"]["rollouts"],
+        )
+        value = RecurrentSharedValue(
+            state_space,
+            action_space,
+            env.device,
+            num_agents=len(possible_agents),
+            num_envs=env.num_envs,
+            hidden_size=hidden_size,
+            mlp_units=mlp_units,
+            sequence_length=cfg["agent"]["rollouts"],
+        )
+        policy.init_state_dict("policy")
+        value.init_state_dict("value")
+        return {
+            uid: {"policy": policy, "value": value}
+            for uid in possible_agents
+        }
+
+    def generate_agent(self, env, cfg, models):
+        if cfg.get("agent", {}).get("class", "").lower() != "mappo_rnn":
+            return original_generate_agent(self, env, cfg, models)
+
+        from skrl.memories.torch import RandomMemory
+        from skrl.multi_agents.torch.mappo import MAPPO_DEFAULT_CONFIG
+
+        from srb.integrations.skrl.mappo_rnn import SharedMAPPORNN
+
+        possible_agents = list(env.possible_agents)
+        memory_cfg = copy.deepcopy(cfg.get("memory", {}))
+        memory_class = self._component(memory_cfg.pop("class", "RandomMemory"))
+        if memory_class is not RandomMemory:
+            raise ValueError("MAPPO_RNN currently requires RandomMemory.")
+        if memory_cfg.get("memory_size", -1) < 0:
+            memory_cfg["memory_size"] = cfg["agent"]["rollouts"]
+        memories = {
+            uid: memory_class(
+                num_envs=env.num_envs,
+                device=env.device,
+                **self._process_cfg(memory_cfg),
+            )
+            for uid in possible_agents
+        }
+
+        agent_cfg = MAPPO_DEFAULT_CONFIG.copy()
+        agent_cfg.update(self._process_cfg(copy.deepcopy(cfg["agent"])))
+        observation_spaces = env.observation_spaces
+        state_spaces = env.state_spaces
+        agent_cfg["state_preprocessor_kwargs"].update(
+            {
+                uid: {"size": observation_spaces[uid], "device": env.device}
+                for uid in possible_agents
+            }
+        )
+        agent_cfg["shared_state_preprocessor_kwargs"].update(
+            {
+                uid: {"size": state_spaces[uid], "device": env.device}
+                for uid in possible_agents
+            }
+        )
+        agent_cfg["value_preprocessor_kwargs"].update(
+            {uid: {"size": 1, "device": env.device} for uid in possible_agents}
+        )
+        return SharedMAPPORNN(
+            models=models,
+            memories=memories,
+            observation_spaces=observation_spaces,
+            action_spaces=env.action_spaces,
+            shared_observation_spaces=state_spaces,
+            possible_agents=possible_agents,
+            device=env.device,
+            cfg=agent_cfg,
+        )
+
+    Runner._generate_models = generate_models
+    Runner._generate_agent = generate_agent
+    Runner._srb_mappo_rnn_support = True
+
+
 def _configure_wandb_global_step_axis() -> None:
     """Use environment timesteps as the default W&B x-axis."""
     try:
@@ -532,7 +716,9 @@ def run(
     from skrl.utils.runner.torch import Runner
 
     _install_ppo_rnn_runner_support()
+    _install_mappo_rnn_runner_support()
     _configure_ppo_rnn_hyperparameters(agent_cfg, env, workflow)
+    _configure_mappo_hyperparameters(agent_cfg, env, workflow)
     skrl_config.torch.device = env.device
     _install_native_wandb_scalar_logging()
     _install_mappo_policy_action_logging()

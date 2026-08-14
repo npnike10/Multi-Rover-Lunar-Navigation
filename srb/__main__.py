@@ -213,8 +213,55 @@ def run_agent_with_env(
         # Add wrapper for video recording
         if video_enable:
             from datetime import datetime
+            from gymnasium.wrappers import RecordVideo
 
-            env = gymnasium.wrappers.RecordVideo(
+            video_wrapper = RecordVideo
+            if hasattr(env.unwrapped, "possible_agents"):
+                class MarlRecordVideo(RecordVideo):
+                    """RecordVideo variant that understands MARL done dictionaries."""
+
+                    @staticmethod
+                    def _done(signal: Any) -> bool:
+                        if isinstance(signal, Mapping):
+                            return any(
+                                MarlRecordVideo._done(value)
+                                for value in signal.values()
+                            )
+                        try:
+                            return bool(signal.any().item())
+                        except AttributeError:
+                            return bool(signal)
+
+                    def step(self, action):
+                        result = self.env.step(action)
+                        terminateds, truncateds = result[2], result[3]
+                        terminated = self._done(terminateds)
+                        truncated = self._done(truncateds)
+
+                        if not (self.terminated or self.truncated):
+                            self.step_id += 1
+                            if terminated or truncated:
+                                self.episode_id += 1
+                                self.terminated = terminated
+                                self.truncated = truncated
+
+                            if self.recording:
+                                assert self.video_recorder is not None
+                                self.video_recorder.capture_frame()
+                                self.recorded_frames += 1
+                                if self.video_length > 0:
+                                    if self.recorded_frames > self.video_length:
+                                        self.close_video_recorder()
+                                elif terminated or truncated:
+                                    self.close_video_recorder()
+                            elif self._video_enabled():
+                                self.start_video_recorder()
+
+                        return result
+
+                video_wrapper = MarlRecordVideo
+
+            env = video_wrapper(
                 env,
                 video_folder=logdir.joinpath("videos")
                 .joinpath(datetime.now().strftime(DEFAULT_DATETIME_FORMAT))
