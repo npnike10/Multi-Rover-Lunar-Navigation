@@ -1,56 +1,36 @@
-# https://skrl.readthedocs.io/en/latest/api/utils/model_instantiators.html
-models:
-  separate: False
-  policy:
-    class: GaussianMixin
-    clip_actions: False
-    clip_log_std: True
-    min_log_std: -20.0
-    max_log_std: 2.0
-    initial_log_std: -2.0
-    network:
-      - name: net
-        input: 'concatenate((
-          STATES["state_dyn"],
-          STATES["proprio"],
-          STATES["proprio_dyn"],
-          STATES["command"]
-          ))'
-        layers: [384, 384]
-        activations: elu
-    output: ACTIONS
-  value:
-    class: DeterministicMixin
-    clip_actions: False
-    network:
-      - name: net
-        input: 'concatenate((
-          STATES["state_dyn"],
-          STATES["proprio"],
-          STATES["proprio_dyn"],
-          STATES["command"]
-          ))'
-        layers: [384, 384]
-        activations: elu
-    output: ONE
+# SRB waypoint-navigation PPO-LSTM configuration.
+# ``minibatch_size`` is translated by srb.integrations.skrl.main into SKRL's
+# ``mini_batches`` count using rollouts * env.num_envs. Therefore training must
+# use a number of parallel environments for which 128 * env.num_envs is an
+# exact multiple of 1024 (for example, env.num_envs=8, 16, 32, ...).
 
-# https://skrl.readthedocs.io/en/latest/api/memories/sequential.html
+# The installed SKRL runner has no recurrent model instantiator. SRB constructs
+# these LSTM models directly in ``srb.integrations.skrl.main``.
+models:
+  policy:
+    lstm_hidden_size: 384
+    mlp_units: [384, 384]
+  value:
+    lstm_hidden_size: 384
+    mlp_units: [384, 384]
+
+# PPO_RNN samples recurrent sequences from RandomMemory in the installed SKRL
+# release. The buffer stores 128 transitions per parallel environment.
 memory:
-  class: SequencedMemory
-  memory_size: 256
-  num_sequences: 16
-  sequence_length: 256
+  class: RandomMemory
+  memory_size: 128
 
 # https://skrl.readthedocs.io/en/latest/api/agents/ppo_rnn.html
 agent:
   class: PPO_RNN
-  rollouts: 64
+  rollouts: 128
+  minibatch_size: 1024
+  mini_batches: 1  # Set at runtime from minibatch_size and env.num_envs
   learning_epochs: 16
-  mini_batches: 8
   discount_factor: 0.997
-  lambda: 0.9
+  lambda: 0.95
   learning_rate: 1.0e-4
-  learning_rate_scheduler: null
+  learning_rate_scheduler: linear_to_zero
   learning_rate_scheduler_kwargs: {}
   state_preprocessor: RunningStandardScaler
   state_preprocessor_kwargs: null
@@ -59,9 +39,9 @@ agent:
   random_timesteps: 0
   learning_starts: 0
   grad_norm_clip: 0.5
-  ratio_clip: 0.1
-  value_clip: 0.1
-  clip_predicted_values: True
+  ratio_clip: 0.2
+  value_clip: 0.2
+  clip_predicted_values: False
   entropy_loss_scale: 0.01
   value_loss_scale: 0.5
   kl_threshold: 0.0
@@ -71,11 +51,14 @@ agent:
     directory: "MISSING"
     experiment_name: "MISSING"
     write_interval: auto
-    checkpoint_interval: 1000
+    checkpoint_interval: 100000
     wandb: True
+    wandb_kwargs:
+      project: "Multi-Rover-Lunar-Navigation"
+      entity: "niket-parikh-lira"
 
 # https://skrl.readthedocs.io/en/latest/api/trainers/sequential.html
 trainer:
   class: SequentialTrainer
-  timesteps: 200000000
+  timesteps: 390625
   environment_info: log

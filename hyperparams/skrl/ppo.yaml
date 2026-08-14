@@ -71,6 +71,9 @@ agent:
     write_interval: auto
     checkpoint_interval: 1000
     wandb: True
+    wandb_kwargs:
+      project: "Multi-Rover-Lunar-Navigation"
+      entity: "niket-parikh-lira"
 
 # https://skrl.readthedocs.io/en/latest/api/trainers/sequential.html
 trainer:

@@ -11,6 +11,47 @@ from skrl.utils.spaces.torch import (
 )
 
 
+class SingleAgentMarlAdapter(gymnasium.Wrapper):
+    """Expose a one-agent DirectMARLEnv through Gymnasium's single-agent API.
+
+    A MARL task remains dictionary-based even when it has exactly one possible
+    agent.  SKRL's PPO_RNN is a single-agent algorithm, so this adapter unwraps
+    that one dictionary entry while preserving vectorized environments.
+    """
+
+    def __init__(self, env: Any) -> None:
+        possible_agents = list(env.unwrapped.possible_agents)
+        if len(possible_agents) != 1:
+            raise ValueError(
+                "SingleAgentMarlAdapter requires exactly one possible agent. "
+                f"Received: {possible_agents}."
+            )
+
+        super().__init__(env)
+        self.agent_id = possible_agents[0]
+        self.action_space = env.unwrapped.action_spaces[self.agent_id]
+        self.observation_space = env.unwrapped.observation_spaces[self.agent_id]
+        self.state_space = env.unwrapped.state_space
+
+    def reset(self, **kwargs) -> tuple[torch.Tensor, Any]:
+        observations, info = self.env.reset(**kwargs)
+        return observations[self.agent_id], info
+
+    def step(
+        self, action: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Any]:
+        observations, rewards, terminated, truncated, info = self.env.step(
+            {self.agent_id: action}
+        )
+        return (
+            observations[self.agent_id],
+            rewards[self.agent_id],
+            terminated[self.agent_id],
+            truncated[self.agent_id],
+            info,
+        )
+
+
 class SkrlEnvWrapper(IsaacLabWrapper):
     def __init__(
         self,
@@ -36,13 +77,26 @@ class SkrlEnvWrapper(IsaacLabWrapper):
 
     @cached_property
     def action_space(self) -> gymnasium.Space:
+        if isinstance(self._env, SingleAgentMarlAdapter):
+            action_space = self._env.action_space
+            return gymnasium.spaces.Box(
+                low=-1.0,
+                high=1.0,
+                shape=action_space.shape,
+                dtype=action_space.dtype,
+            )
         return gymnasium.spaces.Box(
             low=-1.0, high=1.0, shape=super().action_space.shape
         )
 
     @cached_property
     def observation_space(self) -> gymnasium.Space:
-        if hasattr(self._unwrapped, "single_observation_space"):
+        # A DirectMARLEnv exposes ``observation_space(agent)`` as a method.
+        # For the one-rover PPO path, retain the Box declared by the adapter
+        # instead of following ``.unwrapped`` back to that method.
+        if isinstance(self._env, SingleAgentMarlAdapter):
+            obs_space = self._env.observation_space
+        elif hasattr(self._unwrapped, "single_observation_space"):
             obs_space = self._unwrapped.single_observation_space
         else:
             obs_space = self._unwrapped.observation_space
@@ -57,6 +111,8 @@ class SkrlEnvWrapper(IsaacLabWrapper):
     @cached_property
     def state_space(self) -> gymnasium.Space | None:
         """State space"""
+        if isinstance(self._env, SingleAgentMarlAdapter):
+            return self._env.state_space
         if hasattr(self._unwrapped, "state_space"):
             return self._unwrapped.state_space
 
