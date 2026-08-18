@@ -90,6 +90,19 @@ class MarlWaypointTaskCfg(GroundMarlEnvCfg):
     episode_length_s: float = 60.0
     is_finite_horizon: bool = False
 
+    # -- Action and observation latency ------------------------------------
+    # Match the state-based SRB waypoint task.  Delays are measured in agent
+    # steps (the default agent rate is 25 Hz).  A range is sampled separately
+    # for every rover in every parallel environment at reset, then may drift
+    # by one step at the configured interval.  Set both values to ``0`` for
+    # the previous zero-latency MARL behavior.
+    action_delay_steps: int | tuple[int, int] = (0, 3)
+    action_delay_on_step_change_freq: float = 1.0
+    action_delay_on_step_change_prob: float = 0.01
+    observation_delay_steps: int | tuple[int, int] = (0, 1)
+    observation_delay_on_step_change_freq: float = 1.0
+    observation_delay_on_step_change_prob: float = 0.01
+
     # -- Moving waypoint event (matches the single-rover SRB task) ----------
     target_event_interval_s: float = 0.05
     target_pos_step_range: tuple[float, float] = (0.005, 0.01)
@@ -173,6 +186,18 @@ class MarlWaypointTaskCfg(GroundMarlEnvCfg):
             raise ValueError("proximity_safe_distance must be positive.")
         if self.multi_rover_target_motion_half_range <= 0.0:
             raise ValueError("multi_rover_target_motion_half_range must be positive.")
+        self._validate_delay_config(
+            "action_delay_steps",
+            self.action_delay_steps,
+            self.action_delay_on_step_change_freq,
+            self.action_delay_on_step_change_prob,
+        )
+        self._validate_delay_config(
+            "observation_delay_steps",
+            self.observation_delay_steps,
+            self.observation_delay_on_step_change_freq,
+            self.observation_delay_on_step_change_prob,
+        )
 
         # All agents in this task are homogeneous Leo waypoint navigators.
         # Rebuild the mapping from the public ``num_rovers`` override before
@@ -287,6 +312,28 @@ class MarlWaypointTaskCfg(GroundMarlEnvCfg):
             )
 
     @staticmethod
+    def _validate_delay_config(
+        name: str,
+        delay: int | tuple[int, int],
+        change_frequency: float,
+        change_probability: float,
+    ) -> None:
+        """Validate an SRB-style integer delay configuration."""
+        lower, upper = (delay, delay) if isinstance(delay, int) else delay
+        if lower < 0 or upper < lower:
+            raise ValueError(
+                f"{name} must be a non-negative integer or an ordered "
+                f"(min, max) pair. Received: {delay!r}."
+            )
+        if change_frequency <= 0.0:
+            raise ValueError(f"{name} change frequency must be positive.")
+        if not 0.0 <= change_probability <= 1.0:
+            raise ValueError(
+                f"{name} change probability must be in [0, 1]. Received: "
+                f"{change_probability}."
+            )
+
+    @staticmethod
     def _spawn_window(index: int, count: int) -> tuple[float, float, float]:
         """Return a separated SRB-style reset window for one rover.
 
@@ -381,6 +428,149 @@ class MarlWaypointTask(GroundMarlEnv):
 
         self._proximity_safe_distance = self.cfg.proximity_safe_distance
 
+        # DirectMARLEnv does not provide DirectEnv's delay machinery.  Keep a
+        # separate delay process and history per rover, matching what each
+        # rover would experience when running the original single-agent task.
+        self._init_delay_buffers()
+
+    # ------------------------------------------------------------------ #
+    # Action and observation delay
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _delay_bounds(delay: int | tuple[int, int]) -> tuple[int, int]:
+        """Normalize a fixed delay or inclusive delay range."""
+        return (delay, delay) if isinstance(delay, int) else delay
+
+    def _init_delay_buffers(self) -> None:
+        """Allocate zero-filled, per-rover delay buffers.
+
+        A history has ``maximum_delay + 1`` entries so that delay zero reads
+        the command/measurement just written while the largest delay reads a
+        genuinely older entry.  The additional slot also preserves the
+        intended zero-action/zero-observation warm-up after reset.
+        """
+        self._min_action_delay_steps, self._max_action_delay_steps = (
+            self._delay_bounds(self.cfg.action_delay_steps)
+        )
+        self._min_observation_delay_steps, self._max_observation_delay_steps = (
+            self._delay_bounds(self.cfg.observation_delay_steps)
+        )
+
+        self._action_delay_steps = {
+            agent_id: torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+            for agent_id in self.cfg.possible_agents
+        }
+        self._observation_delay_steps = {
+            agent_id: torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+            for agent_id in self.cfg.possible_agents
+        }
+
+        self._action_history_buffer: dict[str, torch.Tensor] | None = None
+        self._action_history_buffer_ptr = 0
+        if self._max_action_delay_steps > 0:
+            self._action_history_buffer = {
+                agent_id: torch.zeros(
+                    self._max_action_delay_steps + 1,
+                    self.num_envs,
+                    2,
+                    device=self.device,
+                )
+                for agent_id in self.cfg.possible_agents
+            }
+
+        self._observation_history_buffer: dict[str, torch.Tensor] | None = None
+        self._observation_history_buffer_ptr = 0
+        if self._max_observation_delay_steps > 0:
+            self._observation_history_buffer = {
+                agent_id: torch.zeros(
+                    self._max_observation_delay_steps + 1,
+                    self.num_envs,
+                    self.cfg.local_observation_dim,
+                    device=self.device,
+                )
+                for agent_id in self.cfg.possible_agents
+            }
+
+    def _reset_delay_buffers(self, env_ids: Sequence[int]) -> None:
+        """Sample fresh delays and clear history for reset environments."""
+        num_reset_envs = len(env_ids)
+        for agent_id in self.cfg.possible_agents:
+            self._action_delay_steps[agent_id][env_ids] = torch.randint(
+                self._min_action_delay_steps,
+                self._max_action_delay_steps + 1,
+                (num_reset_envs,),
+                device=self.device,
+            )
+            self._observation_delay_steps[agent_id][env_ids] = torch.randint(
+                self._min_observation_delay_steps,
+                self._max_observation_delay_steps + 1,
+                (num_reset_envs,),
+                device=self.device,
+            )
+            if self._action_history_buffer is not None:
+                self._action_history_buffer[agent_id][:, env_ids] = 0.0
+            if self._observation_history_buffer is not None:
+                self._observation_history_buffer[agent_id][:, env_ids] = 0.0
+
+    def _advance_delay_process(
+        self,
+        delays: dict[str, torch.Tensor],
+        minimum: int,
+        maximum: int,
+        change_frequency: float,
+        change_probability: float,
+    ) -> None:
+        """Occasionally move each rover's delay by one bounded agent step."""
+        if (
+            change_probability <= 0.0
+            or minimum == maximum
+            or (self.sim.current_time % change_frequency) >= self.cfg.agent_rate
+        ):
+            return
+
+        for agent_delays in delays.values():
+            random_values = torch.rand(self.num_envs, device=self.device)
+            decrease = (agent_delays > minimum) & (
+                random_values < change_probability
+            )
+            increase = (agent_delays < maximum) & (
+                random_values > (1.0 - change_probability)
+            )
+            agent_delays[decrease] -= 1
+            agent_delays[increase] += 1
+
+    def _apply_observation_delay(
+        self, observations: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        """Store current observations and return each rover's delayed view."""
+        if self._observation_history_buffer is None:
+            return observations
+
+        history_length = self._max_observation_delay_steps + 1
+        env_indices = torch.arange(self.num_envs, device=self.device)
+        delayed_observations = {}
+        for agent_id, observation in observations.items():
+            history = self._observation_history_buffer[agent_id]
+            history[self._observation_history_buffer_ptr] = observation
+            read_indices = (
+                self._observation_history_buffer_ptr
+                - self._observation_delay_steps[agent_id]
+            ) % history_length
+            delayed_observations[agent_id] = history[read_indices, env_indices]
+
+        self._observation_history_buffer_ptr = (
+            self._observation_history_buffer_ptr + 1
+        ) % history_length
+        self._advance_delay_process(
+            self._observation_delay_steps,
+            self._min_observation_delay_steps,
+            self._max_observation_delay_steps,
+            self.cfg.observation_delay_on_step_change_freq,
+            self.cfg.observation_delay_on_step_change_prob,
+        )
+        return delayed_observations
+
     # ------------------------------------------------------------------ #
     # Reset and actions
     # ------------------------------------------------------------------ #
@@ -388,6 +578,8 @@ class MarlWaypointTask(GroundMarlEnv):
     def _reset_idx(self, env_ids: Sequence[int]):
         """Reset rover-local buffers, targets, and episodic observation noise."""
         super()._reset_idx(env_ids)
+
+        self._reset_delay_buffers(env_ids)
 
         origins = self.scene.env_origins[env_ids]
         for index, agent_id in enumerate(self.cfg.possible_agents):
@@ -415,13 +607,42 @@ class MarlWaypointTask(GroundMarlEnv):
             )
 
     def _pre_physics_step(self, actions: dict[str, torch.Tensor]) -> None:
-        """Clamp normalized rover commands and send them to the drive terms."""
+        """Queue normalized commands and send the per-rover delayed commands."""
         flat_actions = []
+        env_indices = torch.arange(self.num_envs, device=self.device)
+        history_length = self._max_action_delay_steps + 1
         for agent_id in self.cfg.possible_agents:
             action = actions[agent_id].to(self.device).clamp(-1.0, 1.0)
+
+            if self._action_history_buffer is None:
+                applied_action = action
+            else:
+                history = self._action_history_buffer[agent_id]
+                history[self._action_history_buffer_ptr] = action
+                read_indices = (
+                    self._action_history_buffer_ptr
+                    - self._action_delay_steps[agent_id]
+                ) % history_length
+                applied_action = history[read_indices, env_indices]
+
+            # Rewards use the change in commands that actually reach the
+            # rover, consistent with the delayed action-manager path in the
+            # original waypoint task.
             self._previous_actions[agent_id][:] = self._actions[agent_id]
-            self._actions[agent_id][:] = action
-            flat_actions.append(action)
+            self._actions[agent_id][:] = applied_action
+            flat_actions.append(applied_action)
+
+        if self._action_history_buffer is not None:
+            self._action_history_buffer_ptr = (
+                self._action_history_buffer_ptr + 1
+            ) % history_length
+            self._advance_delay_process(
+                self._action_delay_steps,
+                self._min_action_delay_steps,
+                self._max_action_delay_steps,
+                self.cfg.action_delay_on_step_change_freq,
+                self.cfg.action_delay_on_step_change_prob,
+            )
 
         self.action_manager.process_action(torch.cat(flat_actions, dim=-1))
 
@@ -504,7 +725,7 @@ class MarlWaypointTask(GroundMarlEnv):
 
             observations[agent_id] = torch.cat(parts, dim=-1)
 
-        return observations
+        return self._apply_observation_delay(observations)
 
     def _get_states(self) -> torch.Tensor:
         """Return the compact unnoised planar CTDE state.

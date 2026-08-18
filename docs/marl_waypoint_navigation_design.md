@@ -6,6 +6,7 @@
 SRB's state-based single-rover waypoint-navigation task. Every rover has an
 individual moving planar waypoint and a decentralized noisy observation. The
 task can return either each rover's own reward or a common mean team reward.
+It also reproduces the original task's action and observation latency model.
 
 `num_rovers` defines the homogeneous Leo team.  Its default is `3`, producing
 `rover_1`, `rover_2`, and `rover_3`; set `env.num_rovers=1` to create the
@@ -26,7 +27,7 @@ goal-completion termination.
   at the default spacing). For two or more rovers, each target instead starts
   at, and remains inside, a distinct persistent region centered on that
   rover's separated reset-window center. The default region half-width is
-  `0.2 m` (`env.multi_rover_target_motion_half_range`). This prevents all
+  `1.0 m` (`env.multi_rover_target_motion_half_range`). This prevents all
   rovers from initially pursuing the same origin waypoint. Targets evolve
   every 0.05 s via the same `offset_pose_natural` event: XY step size
   `[0.005, 0.01]` m, position smoothness `0.99`, step-size smoothness `0.8`,
@@ -41,7 +42,7 @@ For `N` rovers, all positions are two-dimensional task positions.
 |:---|:---|
 | Agents | `I = {1, …, N}`; every rover owns target `g_i`. |
 | Actions | `a_i = (a_linear, a_angular) ∈ [-1, 1]^2`. The default Leo drive maps them to `v_linear = 0.4 a_linear` m/s and `v_angular = (π/3) a_angular` rad/s (60°/s). |
-| Local observation | `[noisy relative XY to g_i (2), noisy relative target yaw as sin/cos (2), noisy relative XY to each rover j ≠ i (2(N-1))]`; dimension `4 + 2(N-1)`. |
+| Local observation | A delayed noisy `[relative XY to g_i (2), relative target yaw as sin/cos (2), relative XY to each rover j ≠ i (2(N-1))]`; dimension `4 + 2(N-1)`. |
 | Critic state | Unnoised environment-relative rover `[XY, sin(yaw), cos(yaw)]` for all rovers, followed by the same fields for all targets; dimension `8N`. |
 | Reward | `env.reward_mode=individual` (default): each rover gets its own SRB reward minus its own optional proximity penalty. `team`: every rover gets the mean of those individual rewards. |
 | Termination | No success or rollover termination; timeout only. |
@@ -50,6 +51,27 @@ The centralized-critic state is intentionally a compact planar task state.  It
 does not claim to be the complete simulator-Markov state: simulator velocities
 and latent target-motion state remain privileged physical information outside
 this vector.
+
+## Action and observation latency
+
+The task maintains independent action and observation delay buffers for every
+rover in every parallel environment. By default, an action delay is sampled
+uniformly from `0..3` agent steps and an observation delay from `0..1` agent
+steps at reset. At the default 25 Hz agent rate, these correspond to up to
+120 ms and 40 ms respectively. Buffers are zero-filled at reset, so the
+initial delayed commands or observations are valid zero tensors. With current
+delays (d^a_{i,t}) and (d^o_{i,t}), the applied command and policy input
+are
+
+```text
+applied_action[i, t] = policy_action[i, t - d^a[i, t]]
+policy_observation[i, t] = noisy_observation[i, t - d^o[i, t]]
+```
+
+`env.action_delay_on_step_change_prob` and
+`env.observation_delay_on_step_change_prob` default to `0.01`; at their
+default one-second check interval, they can move each delay by one bounded
+step. Set both delay ranges to `0` to disable latency.
 
 ## Observation noise
 
@@ -104,7 +126,7 @@ R_team = mean_i(R_i)
 `env.reward_mode` selects the returned reward: `individual` (the default)
 returns `R_i` to rover `i`; `team` returns `R_team` to every rover. The
 proximity term is therefore always assigned to the rovers in the close pair,
-even in team mode before averaging. `w_proximity` defaults to `0.0`.
+even in team mode before averaging. `w_proximity` defaults to `1.0`.
 `d_safe` defaults to one Leo rover length, `0.3587 m`, and can be overridden
 with `env.proximity_safe_distance`. The pair term is zero for a single rover.
 Consequently, one rover with the default proximity weight has the original SRB
