@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     from srb._typing import AnyEnv, AnyEnvCfg
 
 FRAMEWORK_NAME = "skrl"
+_SRB_WANDB_GLOBAL_STEP_AXIS_DEFINED = False
 
 
 def _install_ppo_rnn_runner_support() -> None:
@@ -460,15 +461,19 @@ def _install_mappo_rnn_runner_support() -> None:
 
 def _configure_wandb_global_step_axis() -> None:
     """Use environment timesteps as the default W&B x-axis."""
+    global _SRB_WANDB_GLOBAL_STEP_AXIS_DEFINED
     try:
         import wandb
 
         run = getattr(wandb, "run", None)
-        if run is None or getattr(run, "_srb_global_step_axis_defined", False):
+        if run is None or _SRB_WANDB_GLOBAL_STEP_AXIS_DEFINED:
             return
         wandb.define_metric("global_step")
         wandb.define_metric("*", step_metric="global_step", step_sync=True)
-        setattr(run, "_srb_global_step_axis_defined", True)
+        # W&B Run objects use a restricted attribute interface, so keep this
+        # process-local guard in the integration module instead of attaching
+        # custom state to the Run instance.
+        _SRB_WANDB_GLOBAL_STEP_AXIS_DEFINED = True
     except Exception as exc:
         logging.warning(f"Failed to configure W&B global_step axis: {exc}")
 

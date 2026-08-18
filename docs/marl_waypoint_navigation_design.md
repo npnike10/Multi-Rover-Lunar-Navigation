@@ -3,9 +3,9 @@
 ## Overview
 
 `marl_waypoint_navigation` is a homogeneous-rover **Dec-POMDP** extension of
-SRB's state-based single-rover waypoint-navigation task.  Every rover has an
-individual moving planar waypoint.  It receives a decentralized noisy
-observation and the same scalar team reward as every other rover.
+SRB's state-based single-rover waypoint-navigation task. Every rover has an
+individual moving planar waypoint and a decentralized noisy observation. The
+task can return either each rover's own reward or a common mean team reward.
 
 `num_rovers` defines the homogeneous Leo team.  Its default is `3`, producing
 `rover_1`, `rover_2`, and `rover_3`; set `env.num_rovers=1` to create the
@@ -21,12 +21,16 @@ goal-completion termination.
   root height in `[0.4, 0.6]` m, yaw in `[-π, π]`, and the original initial
   velocity ranges.  Multi-rover runs retain those height, yaw, and velocity
   distributions but shift their XY window centers to prevent initial overlap.
-- Every virtual target starts at its environment origin with identity
-  orientation.  It evolves every 0.05 s via the same `offset_pose_natural`
-  event as SRB's waypoint task: XY step size `[0.005, 0.01]` m, position
-  smoothness `0.99`, step-size smoothness `0.8`, yaw-only orientation with
-  smoothness `0.8`, and XY bounds `±0.45 × environment spacing` (±14.4 m at
-  the default spacing).
+- A one-rover target starts at its environment origin with identity
+  orientation and uses SRB's XY bounds `±0.45 × environment spacing` (±14.4 m
+  at the default spacing). For two or more rovers, each target instead starts
+  at, and remains inside, a distinct persistent region centered on that
+  rover's separated reset-window center. The default region half-width is
+  `0.2 m` (`env.multi_rover_target_motion_half_range`). This prevents all
+  rovers from initially pursuing the same origin waypoint. Targets evolve
+  every 0.05 s via the same `offset_pose_natural` event: XY step size
+  `[0.005, 0.01]` m, position smoothness `0.99`, step-size smoothness `0.8`,
+  and yaw-only orientation with smoothness `0.8`.
 - Episodes end only at the 60 s time limit.
 
 ## Dec-POMDP definition
@@ -39,7 +43,7 @@ For `N` rovers, all positions are two-dimensional task positions.
 | Actions | `a_i = (a_linear, a_angular) ∈ [-1, 1]^2`. The default Leo drive maps them to `v_linear = 0.4 a_linear` m/s and `v_angular = (π/3) a_angular` rad/s (60°/s). |
 | Local observation | `[noisy relative XY to g_i (2), noisy relative target yaw as sin/cos (2), noisy relative XY to each rover j ≠ i (2(N-1))]`; dimension `4 + 2(N-1)`. |
 | Critic state | Unnoised environment-relative rover `[XY, sin(yaw), cos(yaw)]` for all rovers, followed by the same fields for all targets; dimension `8N`. |
-| Reward | Common team scalar: mean of the original SRB six-term reward for every rover, minus the optional multi-agent proximity penalty. |
+| Reward | `env.reward_mode=individual` (default): each rover gets its own SRB reward minus its own optional proximity penalty. `team`: every rover gets the mean of those individual rewards. |
 | Termination | No success or rollover termination; timeout only. |
 
 The centralized-critic state is intentionally a compact planar task state.  It
@@ -73,7 +77,7 @@ This corrects the earlier proposed XY values of `0.012` and `0.00252`: SRB's
 current waypoint-task implementation uses `0.01` and `0.0025`, respectively.
 Target yaw must remain observable because it is directly rewarded.
 
-## Shared reward
+## Configurable reward
 
 For each rover, the task computes SRB's original state-based components using
 its true target-relative pose and normalized action change:
@@ -92,14 +96,19 @@ r_i = -0.5 * action_rate
     + 8  * orientation_precision
     + 32 * orientation_precision * (1 - tanh(action_rate / 0.1))
 
-R_team = mean_i(r_i) - w_proximity * mean_pairs(max(0, 1 - d_xy / d_safe))
+p_i = mean_{j \neq i}(max(0, 1 - d_{ij} / d_safe))
+R_i = r_i - w_proximity * p_i
+R_team = mean_i(R_i)
 ```
 
-`w_proximity` defaults to `0.0`; `d_safe` defaults to a conservative inferred
-rover length and can be configured explicitly.  The pair term is zero for a
-single rover.  Consequently, one rover with the default proximity weight has
-the original SRB reward exactly; multi-rover training intentionally uses a
-shared average rather than independent rewards.
+`env.reward_mode` selects the returned reward: `individual` (the default)
+returns `R_i` to rover `i`; `team` returns `R_team` to every rover. The
+proximity term is therefore always assigned to the rovers in the close pair,
+even in team mode before averaging. `w_proximity` defaults to `0.0`.
+`d_safe` defaults to one Leo rover length, `0.3587 m`, and can be overridden
+with `env.proximity_safe_distance`. The pair term is zero for a single rover.
+Consequently, one rover with the default proximity weight has the original SRB
+reward exactly.
 
 ## Compatibility notes
 

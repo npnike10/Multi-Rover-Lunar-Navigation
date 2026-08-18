@@ -1,10 +1,10 @@
 """SRB-compatible multi-agent waypoint navigation task.
 
 This task is a Dec-POMDP extension of SRB's state-based single-rover waypoint
-navigation task.  Every rover owns one moving planar waypoint and receives the
-same team reward: the mean of the original SRB per-rover rewards, optionally
-minus a rover--rover proximity penalty.  Configuring one rover and leaving
-``w_proximity`` at zero reproduces the original task's task signals.
+navigation task. Every rover owns one moving planar waypoint. Rewards can be
+either the rover's own original-SRB reward or the mean team reward; an optional
+proximity penalty is always computed per rover before this aggregation.
+Configuring one rover reproduces the original task's task signals.
 
 Each decentralized observation contains the rover's noisy target-relative XY
 position, noisy target-relative yaw encoded as sine/cosine, and noisy relative
@@ -13,7 +13,7 @@ IMU, terrain observation, goal-completion, or rollover signal.
 """
 
 import math
-from typing import Sequence
+from typing import Literal, Sequence
 
 import gymnasium
 import torch
@@ -33,7 +33,6 @@ from srb.core.sim import PreviewSurfaceCfg
 from srb.core.sim.spawners.shapes.extras.cfg import PinnedArrowCfg
 from srb.utils.cfg import configclass
 from srb.utils.math import matrix_from_quat, subtract_frame_transforms
-
 
 ###############################################################################
 # Scene and event configuration
@@ -98,6 +97,14 @@ class MarlWaypointTaskCfg(GroundMarlEnvCfg):
     target_pos_step_smoothness: float = 0.8
     target_orient_smoothness: float = 0.8
     target_pos_range_ratio: float = 0.9
+    multi_rover_target_motion_half_range: float = 1
+    """Half-width (m) of each multi-rover target's persistent XY region.
+
+    Each target region is centered on the corresponding rover's reset-window
+    center. This prevents the three targets from initially coinciding at the
+    environment origin while retaining the original broad SRB target region
+    when ``num_rovers=1``.
+    """
 
     # -- Observation noise (matches the single-rover SRB task) -------------
     # Noise is per coordinate.  Each directed observer-to-entity XY relation
@@ -107,9 +114,13 @@ class MarlWaypointTaskCfg(GroundMarlEnvCfg):
     episodic_yaw_noise_std: float = math.radians(2.5)
     per_step_yaw_noise_std: float = math.radians(0.5)
 
-    # -- Multi-agent-only team safety term ----------------------------------
-    w_proximity: float = 0.0
-    proximity_safe_distance: float | None = None
+    # -- Multi-agent reward and safety terms --------------------------------
+    reward_mode: Literal["individual", "team"] = "individual"
+    """``individual`` returns each rover's own reward; ``team`` returns their mean."""
+
+    w_proximity: float = 1.0
+    # Leo's longitudinal wheelbase is 0.3587 m and serves as one rover length.
+    proximity_safe_distance: float = 0.3587
 
     # -- Visuals -------------------------------------------------------------
     target_marker_cfg: VisualizationMarkersCfg = VisualizationMarkersCfg(
@@ -153,23 +164,41 @@ class MarlWaypointTaskCfg(GroundMarlEnvCfg):
             raise ValueError(
                 f"num_rovers must be at least 1. Received: {self.num_rovers}."
             )
+        if self.reward_mode not in {"individual", "team"}:
+            raise ValueError(
+                "reward_mode must be either 'individual' or 'team'. "
+                f"Received: {self.reward_mode!r}."
+            )
+        if self.proximity_safe_distance <= 0.0:
+            raise ValueError("proximity_safe_distance must be positive.")
+        if self.multi_rover_target_motion_half_range <= 0.0:
+            raise ValueError("multi_rover_target_motion_half_range must be positive.")
 
         # All agents in this task are homogeneous Leo waypoint navigators.
         # Rebuild the mapping from the public ``num_rovers`` override before
         # the base configuration creates scene assets and action terms.
         self.robots = {
-            f"rover_{index + 1}": assets.LeoRover()
-            for index in range(self.num_rovers)
+            f"rover_{index + 1}": assets.LeoRover() for index in range(self.num_rovers)
         }
         agent_ids = list(self.robots.keys())
 
         # The target events must exist before the base configuration builds its
         # event manager.  ``spacing`` may be supplied explicitly; otherwise it
         # is inherited from the 32 m scene configuration.
-        target_bound = 0.5 * self.target_pos_range_ratio * (
-            self.spacing if self.spacing is not None else self.scene.env_spacing
+        single_rover_target_bound = (
+            0.5
+            * self.target_pos_range_ratio
+            * (self.spacing if self.spacing is not None else self.scene.env_spacing)
         )
-        for agent_id in agent_ids:
+        for index, agent_id in enumerate(agent_ids):
+            target_center_x, target_center_y = self._target_center(
+                index, len(agent_ids)
+            )
+            target_bound = (
+                single_rover_target_bound
+                if len(agent_ids) == 1
+                else self.multi_rover_target_motion_half_range
+            )
             setattr(
                 self.events,
                 f"target_{agent_id}_pose_evolution",
@@ -188,8 +217,14 @@ class MarlWaypointTaskCfg(GroundMarlEnvCfg):
                         "pos_smoothness": self.target_pos_smoothness,
                         "pos_step_smoothness": self.target_pos_step_smoothness,
                         "pos_bounds": {
-                            "x": (-target_bound, target_bound),
-                            "y": (-target_bound, target_bound),
+                            "x": (
+                                target_center_x - target_bound,
+                                target_center_x + target_bound,
+                            ),
+                            "y": (
+                                target_center_y - target_bound,
+                                target_center_y + target_bound,
+                            ),
                         },
                         "orient_yaw_only": True,
                         "orient_smoothness": self.target_orient_smoothness,
@@ -270,6 +305,16 @@ class MarlWaypointTaskCfg(GroundMarlEnvCfg):
         angle = 2.0 * math.pi * index / count
         return math.cos(angle), math.sin(angle), 0.2
 
+    def _target_center(self, index: int, count: int) -> tuple[float, float]:
+        """Return the persistent center of one rover's target-motion region.
+
+        Multi-rover target centers coincide with the separated rover reset
+        centers, keeping each target near the rover's own local navigation
+        region. The one-rover center remains the original environment origin.
+        """
+        x_center, y_center, _ = self._spawn_window(index, count)
+        return x_center, y_center
+
 
 ###############################################################################
 # Task
@@ -277,7 +322,7 @@ class MarlWaypointTaskCfg(GroundMarlEnvCfg):
 
 
 class MarlWaypointTask(GroundMarlEnv):
-    """Shared-reward Dec-POMDP extension of SRB waypoint navigation.
+    """Configurable-reward Dec-POMDP extension of SRB waypoint navigation.
 
     No physical sensor object is created for this task.  Target and rover
     relative positions are task-state measurements; configurable Gaussian noise
@@ -321,11 +366,7 @@ class MarlWaypointTask(GroundMarlEnv):
             for observer in self.cfg.possible_agents
             for entity in [
                 "target",
-                *[
-                    other
-                    for other in self.cfg.possible_agents
-                    if other != observer
-                ],
+                *[other for other in self.cfg.possible_agents if other != observer],
             ]
         }
         self._episodic_yaw_noise = {
@@ -333,14 +374,12 @@ class MarlWaypointTask(GroundMarlEnv):
             for agent_id in self.cfg.possible_agents
         }
         self._other_agents = {
-            agent_id: [
-                other for other in self.cfg.possible_agents if other != agent_id
-            ]
+            agent_id: [other for other in self.cfg.possible_agents if other != agent_id]
             for agent_id in self.cfg.possible_agents
         }
         self._target_marker = VisualizationMarkers(self.cfg.target_marker_cfg)
 
-        self._proximity_safe_distance = self._resolve_proximity_safe_distance()
+        self._proximity_safe_distance = self.cfg.proximity_safe_distance
 
     # ------------------------------------------------------------------ #
     # Reset and actions
@@ -351,9 +390,14 @@ class MarlWaypointTask(GroundMarlEnv):
         super()._reset_idx(env_ids)
 
         origins = self.scene.env_origins[env_ids]
-        for agent_id in self.cfg.possible_agents:
+        for index, agent_id in enumerate(self.cfg.possible_agents):
             goal = self._goals[agent_id]
             goal[env_ids, :3] = origins
+            target_center_x, target_center_y = self.cfg._target_center(
+                index, len(self.cfg.possible_agents)
+            )
+            goal[env_ids, 0] += target_center_x
+            goal[env_ids, 1] += target_center_y
             goal[env_ids, 3:7] = 0.0
             goal[env_ids, 3] = 1.0
 
@@ -441,9 +485,7 @@ class MarlWaypointTask(GroundMarlEnv):
                 t02=goal[:, :3],
                 q02=goal[:, 3:7],
             )
-            noisy_target_xy = self._noisy_xy(
-                agent_id, "target", target_pos_b[:, :2]
-            )
+            noisy_target_xy = self._noisy_xy(agent_id, "target", target_pos_b[:, :2])
             target_yaw_b = self._yaw_from_quat(target_quat_b)
             noisy_target_yaw = (
                 target_yaw_b
@@ -458,9 +500,7 @@ class MarlWaypointTask(GroundMarlEnv):
                     q01=rover_quat,
                     t02=rover_positions[other_id],
                 )
-                parts.append(
-                    self._noisy_xy(agent_id, other_id, other_pos_b[:, :2])
-                )
+                parts.append(self._noisy_xy(agent_id, other_id, other_pos_b[:, :2]))
 
             observations[agent_id] = torch.cat(parts, dim=-1)
 
@@ -494,7 +534,7 @@ class MarlWaypointTask(GroundMarlEnv):
         return torch.cat(parts, dim=-1)
 
     # ------------------------------------------------------------------ #
-    # Shared reward
+    # Per-rover reward
     # ------------------------------------------------------------------ #
 
     def _srb_reward(self, agent_id: str) -> torch.Tensor:
@@ -514,8 +554,10 @@ class MarlWaypointTask(GroundMarlEnv):
         angle_to_target = torch.atan2(target_pos_b[:, 1], target_pos_b[:, 0])
         target_yaw_b = self._yaw_from_quat(target_quat_b)
         action_rate = (
-            self._actions[agent_id] - self._previous_actions[agent_id]
-        ).square().mean(dim=-1)
+            (self._actions[agent_id] - self._previous_actions[agent_id])
+            .square()
+            .mean(dim=-1)
+        )
 
         penalty_action_rate = -0.5 * action_rate
         penalty_position_tracking = -torch.square(distance)
@@ -528,8 +570,8 @@ class MarlWaypointTask(GroundMarlEnv):
             1.0 - torch.tanh(torch.abs(target_yaw_b) / 0.2618)
         )
         reward_orientation_tracking = 8.0 * orientation_precision
-        reward_action_rate_at_target = 32.0 * orientation_precision * (
-            1.0 - torch.tanh(action_rate / 0.1)
+        reward_action_rate_at_target = (
+            32.0 * orientation_precision * (1.0 - torch.tanh(action_rate / 0.1))
         )
 
         reward = (
@@ -542,55 +584,57 @@ class MarlWaypointTask(GroundMarlEnv):
         )
         return reward
 
-    def _resolve_proximity_safe_distance(self) -> float:
-        """Use the configured threshold or infer a conservative rover length."""
-        if self.cfg.proximity_safe_distance is not None:
-            return self.cfg.proximity_safe_distance
+    def _individual_proximity_penalties(self) -> dict[str, torch.Tensor]:
+        """Return each rover's mean close-neighbor XY penalty.
 
-        max_extent = 0.0
-        for agent_id in self.cfg.possible_agents:
-            robot = self._robots[agent_id]
-            body_pos = robot.data.body_pos_w[0]
-            root_pos = robot.data.root_pos_w[0]
-            max_extent = max(
-                max_extent, torch.norm(body_pos - root_pos, dim=-1).max().item() * 2.0
-            )
-        return max(max_extent, 1.0e-6)
-
-    def _mean_proximity_penalty(self) -> torch.Tensor:
-        """Return mean XY proximity penalty, or zero for a single rover."""
+        A pair contributes the same normalized penalty to both involved
+        rovers. Averaging each rover's pair contributions keeps the scale
+        independent of the team size. ``proximity_safe_distance`` defaults to
+        one Leo rover length (0.3587 m).
+        """
+        penalties = {agent_id: [] for agent_id in self.cfg.possible_agents}
         if len(self.cfg.possible_agents) < 2:
-            return torch.zeros(self.num_envs, device=self.device)
+            return {
+                agent_id: torch.zeros(self.num_envs, device=self.device)
+                for agent_id in self.cfg.possible_agents
+            }
 
-        positions = [
-            self._robots[agent_id].data.root_link_pose_w[:, :2]
-            for agent_id in self.cfg.possible_agents
-        ]
-        penalties = []
-        for first in range(len(positions)):
-            for second in range(first + 1, len(positions)):
-                distance = torch.norm(positions[first] - positions[second], dim=-1)
-                penalties.append(
-                    torch.clamp(
-                        1.0 - distance / self._proximity_safe_distance, min=0.0
-                    )
+        for first, first_id in enumerate(self.cfg.possible_agents):
+            first_position = self._robots[first_id].data.root_link_pose_w[:, :2]
+            for second_id in self.cfg.possible_agents[first + 1 :]:
+                second_position = self._robots[second_id].data.root_link_pose_w[:, :2]
+                distance = torch.norm(first_position - second_position, dim=-1)
+                penalty = torch.clamp(
+                    1.0 - distance / self._proximity_safe_distance, min=0.0
                 )
-        return torch.stack(penalties, dim=-1).mean(dim=-1)
+                penalties[first_id].append(penalty)
+                penalties[second_id].append(penalty)
+        return {
+            agent_id: torch.stack(agent_penalties, dim=-1).mean(dim=-1)
+            for agent_id, agent_penalties in penalties.items()
+        }
 
     def _get_rewards(self) -> dict[str, torch.Tensor]:
-        """Return the same mean-SRB team reward to every rover.
+        """Return individual rewards or their configurable team mean.
 
-        ``w_proximity`` defaults to zero, so it does not change the baseline
-        task.  When enabled, it subtracts a normalized pairwise XY penalty from
-        the common reward and is the sole multi-agent-specific reward term.
+        Every rover first receives its own unmodified SRB reward minus its own
+        mean close-neighbor proximity penalty. ``reward_mode='team'`` then
+        gives all rovers the mean of these already-penalized individual terms.
         """
-        individual_rewards = []
-        for agent_id in self.cfg.possible_agents:
-            individual_rewards.append(self._srb_reward(agent_id))
+        proximity_penalties = self._individual_proximity_penalties()
+        individual_rewards = {
+            agent_id: self._srb_reward(agent_id)
+            - self.cfg.w_proximity * proximity_penalties[agent_id]
+            for agent_id in self.cfg.possible_agents
+        }
+        if self.cfg.reward_mode == "individual":
+            return individual_rewards
 
-        shared_reward = torch.stack(individual_rewards, dim=-1).mean(dim=-1)
-        shared_reward -= self.cfg.w_proximity * self._mean_proximity_penalty()
-        return {agent_id: shared_reward for agent_id in self.cfg.possible_agents}
+        team_reward = torch.stack(
+            [individual_rewards[agent_id] for agent_id in self.cfg.possible_agents],
+            dim=-1,
+        ).mean(dim=-1)
+        return {agent_id: team_reward for agent_id in self.cfg.possible_agents}
 
     # ------------------------------------------------------------------ #
     # Termination
