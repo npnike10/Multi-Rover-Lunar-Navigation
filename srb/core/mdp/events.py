@@ -261,6 +261,8 @@ def offset_pose_natural(
     pos_bounds: Dict[str, Tuple[float, float]],
     orient_yaw_only: bool,
     orient_smoothness: float,
+    boundary_steering_margin_ratio: float = 0.0,
+    boundary_steering_weight: float = 0.0,
 ):
     """Move the target pose naturally with smoothed random changes in direction and orientation.
 
@@ -275,6 +277,9 @@ def offset_pose_natural(
         pos_bounds: Dictionary of position bounds for each axis
         orient_yaw_only: If True, only the yaw of the orientation will be updated to match the direction of movement.
         orient_smoothness: Value between 0-1 controlling continuity of orientation (higher = smoother)
+        boundary_steering_margin_ratio: Fraction of each bounded axis used as an
+            inward-steering zone. Zero preserves reflection-only boundaries.
+        boundary_steering_weight: Maximum inward steering force at a boundary.
     """
     _env: "AnyEnv" = env.unwrapped  # type: ignore
     if env_ids is None:
@@ -314,14 +319,100 @@ def offset_pose_natural(
         + (1 - pos_step_smoothness) * new_random_step
     )
 
-    delta_pos = pos_velocities * pos_step_sizes.unsqueeze(1)
-    getattr(_env, pos_state_key)[env_ids] = pos_velocities
-    getattr(_env, step_size_state_key)[env_ids] = pos_step_sizes
-
     # -- Apply changes --
     pose_attr = getattr(env, env_attr_name)
     current_pose = pose_attr[env_ids].clone()
     current_positions, current_orientations = current_pose[:, :3], current_pose[:, 3:]
+
+    pos_axis_indices = {"x": 0, "y": 1, "z": 2}
+    pos_active_axes = [
+        pos_axis_indices[axis] for axis in pos_axes if axis in pos_axis_indices
+    ]
+
+    # Steer toward the interior before a target reaches a boundary. This keeps
+    # target yaw coupled to its velocity while avoiding the abrupt 180-degree
+    # velocity reflection that otherwise occurs on a boundary hit.
+    use_boundary_steering = (
+        boundary_steering_margin_ratio > 0.0 and boundary_steering_weight > 0.0
+    )
+    if use_boundary_steering:
+        boundary_force = torch.zeros_like(pos_velocities)
+        for axis in pos_axes:
+            if axis not in pos_bounds:
+                continue
+            axis_idx = pos_axis_indices[axis]
+            min_bound, max_bound = pos_bounds[axis]
+            actual_min = min_bound + env.scene.env_origins[env_ids, axis_idx]
+            actual_max = max_bound + env.scene.env_origins[env_ids, axis_idx]
+            margin = (actual_max - actual_min) * boundary_steering_margin_ratio
+            if torch.any(margin <= 0.0):
+                continue
+            lower_strength = torch.clamp(
+                (actual_min + margin - current_positions[:, axis_idx]) / margin,
+                min=0.0,
+                max=1.0,
+            )
+            upper_strength = torch.clamp(
+                (current_positions[:, axis_idx] - (actual_max - margin)) / margin,
+                min=0.0,
+                max=1.0,
+            )
+            boundary_force[:, axis_idx] = lower_strength - upper_strength
+        pos_velocities = F.normalize(
+            pos_velocities + boundary_steering_weight * boundary_force,
+            p=2,
+            dim=1,
+        )
+
+    # Preserve the original reflection-only behavior: its orientation is
+    # generated from the pre-reflection velocity, while the next event sees
+    # the reflected velocity. Soft steering instead uses its corrected velocity
+    # for both translation and yaw.
+    orientation_velocities = pos_velocities.clone()
+
+    # Apply position movement before deriving the yaw from the corrected
+    # movement direction.
+    delta_pos = pos_velocities * pos_step_sizes.unsqueeze(1)
+    new_positions = current_positions.clone()
+    for axis_idx in pos_active_axes:
+        new_positions[:, axis_idx] += delta_pos[:, axis_idx]
+
+    # Keep the old reflection behavior for callers that do not enable soft
+    # steering. With soft steering, clamp rare numerical overshoots and remove
+    # only the outward component, allowing the next update to curve inward.
+    for axis in pos_axes:
+        if axis not in pos_bounds:
+            continue
+        axis_idx = pos_axis_indices[axis]
+        min_bound, max_bound = pos_bounds[axis]
+        actual_min = min_bound + env.scene.env_origins[env_ids, axis_idx]
+        actual_max = max_bound + env.scene.env_origins[env_ids, axis_idx]
+        below_min = new_positions[:, axis_idx] < actual_min
+        above_max = new_positions[:, axis_idx] > actual_max
+        if use_boundary_steering:
+            if below_min.any():
+                new_positions[below_min, axis_idx] = actual_min[below_min]
+                pos_velocities[below_min, axis_idx] = torch.clamp(
+                    pos_velocities[below_min, axis_idx], min=0.0
+                )
+            if above_max.any():
+                new_positions[above_max, axis_idx] = actual_max[above_max]
+                pos_velocities[above_max, axis_idx] = torch.clamp(
+                    pos_velocities[above_max, axis_idx], max=0.0
+                )
+        else:
+            if below_min.any():
+                new_positions[below_min, axis_idx] = (
+                    2 * actual_min[below_min] - new_positions[below_min, axis_idx]
+                )
+                pos_velocities[below_min, axis_idx] *= -1.0
+            if above_max.any():
+                new_positions[above_max, axis_idx] = (
+                    2 * actual_max[above_max] - new_positions[above_max, axis_idx]
+                )
+                pos_velocities[above_max, axis_idx] *= -1.0
+    getattr(_env, pos_state_key)[env_ids] = pos_velocities
+    getattr(_env, step_size_state_key)[env_ids] = pos_step_sizes
 
     # -- Handle Orientation --
     orient_state_key = f"__{env_attr_name}_natural_movement_orientations"
@@ -331,8 +422,9 @@ def offset_pose_natural(
     last_orientations = getattr(_env, orient_state_key)[env_ids]
 
     # Create a zero vector for axes that are not active
-    active_pos_velocities = pos_velocities.clone()
-    pos_axis_indices = {"x": 0, "y": 1, "z": 2}
+    active_pos_velocities = (
+        pos_velocities if use_boundary_steering else orientation_velocities
+    ).clone()
     inactive_pos_axes = [
         axis_idx for axis, axis_idx in pos_axis_indices.items() if axis not in pos_axes
     ]
@@ -373,36 +465,6 @@ def offset_pose_natural(
         last_orientations, target_orientations, 1.0 - orient_smoothness
     )
     getattr(_env, orient_state_key)[env_ids] = new_orientations.clone()
-
-    # Apply position movement
-    pos_axis_indices = {"x": 0, "y": 1, "z": 2}
-    pos_active_axes = [
-        pos_axis_indices[axis] for axis in pos_axes if axis in pos_axis_indices
-    ]
-    new_positions = current_positions.clone()
-    for axis_idx in pos_active_axes:
-        new_positions[:, axis_idx] += delta_pos[:, axis_idx]
-
-    # Handle position boundaries
-    for axis in pos_axes:
-        if axis in pos_bounds:
-            axis_idx = pos_axis_indices[axis]
-            min_bound, max_bound = pos_bounds[axis]
-            actual_min = min_bound + env.scene.env_origins[env_ids, axis_idx]
-            actual_max = max_bound + env.scene.env_origins[env_ids, axis_idx]
-            below_min = new_positions[:, axis_idx] < actual_min
-            above_max = new_positions[:, axis_idx] > actual_max
-            if below_min.any():
-                new_positions[below_min, axis_idx] = (
-                    2 * actual_min[below_min] - new_positions[below_min, axis_idx]
-                )
-                pos_velocities[below_min, axis_idx] *= -1.0
-            if above_max.any():
-                new_positions[above_max, axis_idx] = (
-                    2 * actual_max[above_max] - new_positions[above_max, axis_idx]
-                )
-                pos_velocities[above_max, axis_idx] *= -1.0
-    getattr(_env, pos_state_key)[env_ids] = pos_velocities
 
     # Update the pose in the environment
     pose_attr[env_ids] = torch.cat([new_positions, new_orientations], dim=-1)

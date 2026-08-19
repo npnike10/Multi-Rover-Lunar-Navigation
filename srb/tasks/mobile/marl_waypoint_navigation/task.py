@@ -96,10 +96,12 @@ class MarlWaypointTaskCfg(GroundMarlEnvCfg):
     # for every rover in every parallel environment at reset, then may drift
     # by one step at the configured interval.  Set both values to ``0`` for
     # the previous zero-latency MARL behavior.
-    action_delay_steps: int | tuple[int, int] = (0, 3)
+    # action_delay_steps: int | tuple[int, int] = (0, 3)
+    action_delay_steps: int | tuple[int, int] = 0
     action_delay_on_step_change_freq: float = 1.0
     action_delay_on_step_change_prob: float = 0.01
-    observation_delay_steps: int | tuple[int, int] = (0, 1)
+    # observation_delay_steps: int | tuple[int, int] = (0, 1)
+    observation_delay_steps: int | tuple[int, int] = 0
     observation_delay_on_step_change_freq: float = 1.0
     observation_delay_on_step_change_prob: float = 0.01
 
@@ -109,8 +111,10 @@ class MarlWaypointTaskCfg(GroundMarlEnvCfg):
     target_pos_smoothness: float = 0.99
     target_pos_step_smoothness: float = 0.8
     target_orient_smoothness: float = 0.8
+    target_boundary_steering_margin_ratio: float = 0.25
+    target_boundary_steering_weight: float = 2.0
     target_pos_range_ratio: float = 0.9
-    multi_rover_target_motion_half_range: float = 1
+    multi_rover_target_motion_half_range: float = 0.2
     """Half-width (m) of each multi-rover target's persistent XY region.
 
     Each target region is centered on the corresponding rover's reset-window
@@ -131,9 +135,9 @@ class MarlWaypointTaskCfg(GroundMarlEnvCfg):
     reward_mode: Literal["individual", "team"] = "individual"
     """``individual`` returns each rover's own reward; ``team`` returns their mean."""
 
-    w_proximity: float = 1.0
+    w_proximity: float = 100.0
     # Leo's longitudinal wheelbase is 0.3587 m and serves as one rover length.
-    proximity_safe_distance: float = 0.3587
+    proximity_safe_distance: float = 1
 
     # -- Visuals -------------------------------------------------------------
     target_marker_cfg: VisualizationMarkersCfg = VisualizationMarkersCfg(
@@ -186,6 +190,12 @@ class MarlWaypointTaskCfg(GroundMarlEnvCfg):
             raise ValueError("proximity_safe_distance must be positive.")
         if self.multi_rover_target_motion_half_range <= 0.0:
             raise ValueError("multi_rover_target_motion_half_range must be positive.")
+        if not 0.0 <= self.target_boundary_steering_margin_ratio < 0.5:
+            raise ValueError(
+                "target_boundary_steering_margin_ratio must be in [0, 0.5)."
+            )
+        if self.target_boundary_steering_weight < 0.0:
+            raise ValueError("target_boundary_steering_weight must be non-negative.")
         self._validate_delay_config(
             "action_delay_steps",
             self.action_delay_steps,
@@ -253,6 +263,10 @@ class MarlWaypointTaskCfg(GroundMarlEnvCfg):
                         },
                         "orient_yaw_only": True,
                         "orient_smoothness": self.target_orient_smoothness,
+                        "boundary_steering_margin_ratio": (
+                            self.target_boundary_steering_margin_ratio
+                        ),
+                        "boundary_steering_weight": self.target_boundary_steering_weight,
                     },
                 ),
             )
@@ -450,8 +464,8 @@ class MarlWaypointTask(GroundMarlEnv):
         genuinely older entry.  The additional slot also preserves the
         intended zero-action/zero-observation warm-up after reset.
         """
-        self._min_action_delay_steps, self._max_action_delay_steps = (
-            self._delay_bounds(self.cfg.action_delay_steps)
+        self._min_action_delay_steps, self._max_action_delay_steps = self._delay_bounds(
+            self.cfg.action_delay_steps
         )
         self._min_observation_delay_steps, self._max_observation_delay_steps = (
             self._delay_bounds(self.cfg.observation_delay_steps)
@@ -531,9 +545,7 @@ class MarlWaypointTask(GroundMarlEnv):
 
         for agent_delays in delays.values():
             random_values = torch.rand(self.num_envs, device=self.device)
-            decrease = (agent_delays > minimum) & (
-                random_values < change_probability
-            )
+            decrease = (agent_delays > minimum) & (random_values < change_probability)
             increase = (agent_delays < maximum) & (
                 random_values > (1.0 - change_probability)
             )
@@ -620,8 +632,7 @@ class MarlWaypointTask(GroundMarlEnv):
                 history = self._action_history_buffer[agent_id]
                 history[self._action_history_buffer_ptr] = action
                 read_indices = (
-                    self._action_history_buffer_ptr
-                    - self._action_delay_steps[agent_id]
+                    self._action_history_buffer_ptr - self._action_delay_steps[agent_id]
                 ) % history_length
                 applied_action = history[read_indices, env_indices]
 
