@@ -26,8 +26,13 @@ goal-completion termination.
   orientation and uses SRB's XY bounds `±0.45 × environment spacing` (±14.4 m
   at the default spacing). For two or more rovers, each target instead starts
   at, and remains inside, a distinct persistent region centered on that
-  rover's separated reset-window center. The default region half-width is
-  `1.0 m` (`env.multi_rover_target_motion_half_range`). This prevents all
+  rover's compact reset-window center. Each target starts at that center, then
+  moves through its own disjoint outward corridor with `6.0 m` extent
+  (`env.multi_rover_target_motion_half_range`) and `3.0 m` lateral half-width
+  (`env.multi_rover_target_lateral_half_range`). The three rover reset centers
+  are spaced on a `1.0 m` radius circle (`env.multi_rover_spawn_radius`), so
+  close initial interactions remain possible while targets eventually move
+  apart. This prevents all
   rovers from initially pursuing the same origin waypoint. Targets evolve
   every 0.05 s via the same `offset_pose_natural` event: XY step size
   `[0.005, 0.01]` m, position smoothness `0.99`, step-size smoothness `0.8`,

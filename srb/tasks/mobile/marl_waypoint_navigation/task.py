@@ -111,17 +111,22 @@ class MarlWaypointTaskCfg(GroundMarlEnvCfg):
     target_pos_smoothness: float = 0.99
     target_pos_step_smoothness: float = 0.8
     target_orient_smoothness: float = 0.8
-    target_boundary_steering_margin_ratio: float = 0.25
+    target_boundary_steering_margin_ratio: float = 0.1
     target_boundary_steering_weight: float = 2.0
     target_pos_range_ratio: float = 0.9
-    multi_rover_target_motion_half_range: float = 0.2
-    """Half-width (m) of each multi-rover target's persistent XY region.
+    multi_rover_target_motion_half_range: float = 6.0
+    """Outward extent (m) of a multi-rover target-motion corridor.
 
-    Each target region is centered on the corresponding rover's reset-window
-    center. This prevents the three targets from initially coinciding at the
-    environment origin while retaining the original broad SRB target region
-    when ``num_rovers=1``.
+    Multi-rover targets begin at their rover's compact reset-window center,
+    then move through a large, disjoint outward corridor. This preserves early
+    interaction risk while avoiding frequent boundary reversals.
     """
+    multi_rover_target_lateral_half_range: float = 3.0
+    """Half-width (m) perpendicular to a multi-rover target's outward motion."""
+    multi_rover_target_inner_margin: float = 0.25
+    """Distance (m) each target corridor extends toward the shared start area."""
+    multi_rover_spawn_radius: float = 1.0
+    """Radius (m) of the compact circular multi-rover reset layout."""
 
     # -- Observation noise (matches the single-rover SRB task) -------------
     # Noise is per coordinate.  Each directed observer-to-entity XY relation
@@ -190,6 +195,14 @@ class MarlWaypointTaskCfg(GroundMarlEnvCfg):
             raise ValueError("proximity_safe_distance must be positive.")
         if self.multi_rover_target_motion_half_range <= 0.0:
             raise ValueError("multi_rover_target_motion_half_range must be positive.")
+        if self.multi_rover_target_lateral_half_range <= 0.0:
+            raise ValueError(
+                "multi_rover_target_lateral_half_range must be positive."
+            )
+        if self.multi_rover_target_inner_margin < 0.0:
+            raise ValueError("multi_rover_target_inner_margin must be non-negative.")
+        if self.multi_rover_spawn_radius <= 0.0:
+            raise ValueError("multi_rover_spawn_radius must be positive.")
         if not 0.0 <= self.target_boundary_steering_margin_ratio < 0.5:
             raise ValueError(
                 "target_boundary_steering_margin_ratio must be in [0, 0.5)."
@@ -217,6 +230,24 @@ class MarlWaypointTaskCfg(GroundMarlEnvCfg):
         }
         agent_ids = list(self.robots.keys())
 
+        if len(agent_ids) > 1:
+            half_spacing = 0.5 * (
+                self.spacing if self.spacing is not None else self.scene.env_spacing
+            )
+            if (
+                self.multi_rover_spawn_radius
+                + max(
+                    self.multi_rover_target_motion_half_range,
+                    self.multi_rover_target_lateral_half_range,
+                )
+                > half_spacing
+            ):
+                raise ValueError(
+                    "multi_rover_spawn_radius + "
+                    "the largest multi-rover target extent must fit within half "
+                    "the environment spacing."
+                )
+
         # The target events must exist before the base configuration builds its
         # event manager.  ``spacing`` may be supplied explicitly; otherwise it
         # is inherited from the 32 m scene configuration.
@@ -228,11 +259,6 @@ class MarlWaypointTaskCfg(GroundMarlEnvCfg):
         for index, agent_id in enumerate(agent_ids):
             target_center_x, target_center_y = self._target_center(
                 index, len(agent_ids)
-            )
-            target_bound = (
-                single_rover_target_bound
-                if len(agent_ids) == 1
-                else self.multi_rover_target_motion_half_range
             )
             setattr(
                 self.events,
@@ -251,16 +277,13 @@ class MarlWaypointTaskCfg(GroundMarlEnvCfg):
                         "pos_step_range": self.target_pos_step_range,
                         "pos_smoothness": self.target_pos_smoothness,
                         "pos_step_smoothness": self.target_pos_step_smoothness,
-                        "pos_bounds": {
-                            "x": (
-                                target_center_x - target_bound,
-                                target_center_x + target_bound,
-                            ),
-                            "y": (
-                                target_center_y - target_bound,
-                                target_center_y + target_bound,
-                            ),
-                        },
+                        "pos_bounds": self._target_motion_bounds(
+                            index,
+                            len(agent_ids),
+                            target_center_x,
+                            target_center_y,
+                            single_rover_target_bound,
+                        ),
                         "orient_yaw_only": True,
                         "orient_smoothness": self.target_orient_smoothness,
                         "boundary_steering_margin_ratio": (
@@ -347,34 +370,73 @@ class MarlWaypointTaskCfg(GroundMarlEnvCfg):
                 f"{change_probability}."
             )
 
-    @staticmethod
-    def _spawn_window(index: int, count: int) -> tuple[float, float, float]:
+    def _spawn_window(self, index: int, count: int) -> tuple[float, float, float]:
         """Return a separated SRB-style reset window for one rover.
 
         A single rover uses the original ``[-0.5, 0.5]`` XY ranges.  The
-        three-rover default uses the former task's proven non-overlapping
-        centers with a 0.2 m jitter.  Other team sizes use evenly spaced points
-        on a 1 m radius circle with the same jitter.
+        multi-rover layout uses evenly spaced points on a configurable circle
+        with the same 0.2 m reset jitter. Target regions use these same centers
+        and can therefore remain disjoint while providing several metres of
+        smooth target motion.
         """
         if count == 1:
             return 0.0, 0.0, 0.5
-        if count == 2:
-            return (-0.5, 0.0, 0.2) if index == 0 else (0.5, 0.0, 0.2)
-        if count == 3:
-            return ((-0.5, 0.0, 0.2), (0.5, -0.5, 0.2), (0.5, 0.5, 0.2))[index]
 
         angle = 2.0 * math.pi * index / count
-        return math.cos(angle), math.sin(angle), 0.2
+        return (
+            self.multi_rover_spawn_radius * math.cos(angle),
+            self.multi_rover_spawn_radius * math.sin(angle),
+            0.2,
+        )
 
     def _target_center(self, index: int, count: int) -> tuple[float, float]:
-        """Return the persistent center of one rover's target-motion region.
+        """Return the compact initial target position for one rover.
 
-        Multi-rover target centers coincide with the separated rover reset
-        centers, keeping each target near the rover's own local navigation
-        region. The one-rover center remains the original environment origin.
+        Multi-rover targets begin at their rover reset centers, then enter
+        their outward motion corridors. The one-rover target remains at the
+        original environment origin.
         """
         x_center, y_center, _ = self._spawn_window(index, count)
         return x_center, y_center
+
+    def _target_motion_bounds(
+        self,
+        index: int,
+        count: int,
+        center_x: float,
+        center_y: float,
+        single_rover_target_bound: float,
+    ) -> dict[str, tuple[float, float]]:
+        """Return an original broad bound or a compact-start outward corridor."""
+        if count == 1:
+            return {
+                "x": (-single_rover_target_bound, single_rover_target_bound),
+                "y": (-single_rover_target_bound, single_rover_target_bound),
+            }
+
+        direction_x = math.cos(2.0 * math.pi * index / count)
+        direction_y = math.sin(2.0 * math.pi * index / count)
+
+        def axis_bounds(center: float, direction: float) -> tuple[float, float]:
+            if direction > 0.25:
+                return (
+                    center - self.multi_rover_target_inner_margin,
+                    center + self.multi_rover_target_motion_half_range,
+                )
+            if direction < -0.25:
+                return (
+                    center - self.multi_rover_target_motion_half_range,
+                    center + self.multi_rover_target_inner_margin,
+                )
+            return (
+                center - self.multi_rover_target_lateral_half_range,
+                center + self.multi_rover_target_lateral_half_range,
+            )
+
+        return {
+            "x": axis_bounds(center_x, direction_x),
+            "y": axis_bounds(center_y, direction_y),
+        }
 
 
 ###############################################################################
