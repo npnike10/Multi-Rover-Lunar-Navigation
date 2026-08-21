@@ -7,18 +7,57 @@
 # The installed SKRL runner has no recurrent model instantiator. SRB constructs
 # these LSTM models directly in ``srb.integrations.skrl.main``.
 models:
+  separate: False
   policy:
-    lstm_hidden_size: 384
-    mlp_units: [384, 384]
+    class: GaussianMixin
+    clip_actions: False
+    clip_log_std: True
+    min_log_std: -20.0
+    max_log_std: 2.0
+    initial_log_std: -2.0
+    network:
+      - name: net
+        input: 'concatenate((
+          STATES["state_dyn"],
+          STATES["proprio"],
+          STATES["proprio_dyn"],
+          STATES["command"]
+          ))'
+        layers: [384, 384]
+        activations: elu
+    # Explicitly defining the RNN here
+    rnn:
+      class: LSTM
+      hidden_size: 384
+      num_layers: 1
+    output: ACTIONS
   value:
-    lstm_hidden_size: 384
-    mlp_units: [384, 384]
+    class: DeterministicMixin
+    clip_actions: False
+    network:
+      - name: net
+        input: 'concatenate((
+          STATES["state_dyn"],
+          STATES["proprio"],
+          STATES["proprio_dyn"],
+          STATES["command"]
+          ))'
+        layers: [384, 384]
+        activations: elu
+    # Explicitly defining the RNN here
+    rnn:
+      class: LSTM
+      hidden_size: 384
+      num_layers: 1
+    output: ONE
 
-# PPO_RNN samples recurrent sequences from RandomMemory in the installed SKRL
-# release. The buffer stores 128 transitions per parallel environment.
+# RNNs dynamically instantiated this way require SequencedMemory 
+# to handle the temporal batches correctly.
 memory:
-  class: RandomMemory
-  memory_size: 128
+  class: SequencedMemory
+  memory_size: 256
+  num_sequences: 16
+  sequence_length: 256
 
 # https://skrl.readthedocs.io/en/latest/api/agents/ppo_rnn.html
 agent:
