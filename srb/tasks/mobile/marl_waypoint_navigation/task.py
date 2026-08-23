@@ -17,6 +17,7 @@ from typing import Literal, Sequence
 
 import gymnasium
 import torch
+import torch.nn.functional as F
 
 from srb import assets
 from srb.core.asset import AssetVariant, Scenery
@@ -29,10 +30,141 @@ from srb.core.env.mobile.ground.marl_env import (
 from srb.core.manager import ActionManager, EventTermCfg
 from srb.core.marker import VisualizationMarkers, VisualizationMarkersCfg
 from srb.core.mdp import offset_pose_natural
-from srb.core.sim import PreviewSurfaceCfg
+from srb.core.sim import CylinderCfg, PreviewSurfaceCfg
 from srb.core.sim.spawners.shapes.extras.cfg import PinnedArrowCfg
 from srb.utils.cfg import configclass
 from srb.utils.math import matrix_from_quat, subtract_frame_transforms
+
+
+def update_marl_waypoint_target_formation(
+    env,
+    env_ids: torch.Tensor | None,
+    goal_attr_names: tuple[str, ...],
+    formation_radius: float,
+    center_half_range: float,
+    center_turn_rate_max: float,
+    formation_turn_rate_max: float,
+    turn_smoothness: float,
+    boundary_margin_ratio: float,
+    boundary_steering_weight: float,
+    event_interval_s: float,
+) -> None:
+    """Move all multi-rover targets as one smooth, slowly turning formation.
+
+    The formation center follows a bounded-curvature path.  Each target holds
+    a fixed place on a slowly rotating regular polygon around that center, so
+    the targets remain close enough for collision-aware navigation while their
+    velocity and yaw remain continuous and trackable.
+    """
+    task = env.unwrapped
+    if env_ids is None:
+        env_ids = torch.arange(task.num_envs, device=task.device)
+    if len(env_ids) == 0:
+        return
+
+    centers = task._target_formation_center[env_ids]
+    center_heading = task._target_formation_center_heading[env_ids]
+    center_turn_rate = task._target_formation_center_turn_rate[env_ids]
+    formation_phase = task._target_formation_phase[env_ids]
+    formation_turn_rate = task._target_formation_turn_rate[env_ids]
+    center_speed = task._target_formation_speed[env_ids]
+
+    # A smooth stochastic angular-rate process gives curved paths without the
+    # discontinuous direction reversals produced by independent random walks.
+    center_turn_rate = torch.clamp(
+        turn_smoothness * center_turn_rate
+        + (1.0 - turn_smoothness)
+        * torch.randn_like(center_turn_rate)
+        * center_turn_rate_max,
+        min=-center_turn_rate_max,
+        max=center_turn_rate_max,
+    )
+    formation_turn_rate = torch.clamp(
+        turn_smoothness * formation_turn_rate
+        + (1.0 - turn_smoothness)
+        * torch.randn_like(formation_turn_rate)
+        * formation_turn_rate_max,
+        min=-formation_turn_rate_max,
+        max=formation_turn_rate_max,
+    )
+    center_heading = center_heading + center_turn_rate * event_interval_s
+    formation_phase = formation_phase + formation_turn_rate * event_interval_s
+
+    center_direction = torch.stack(
+        (torch.cos(center_heading), torch.sin(center_heading)), dim=-1
+    )
+    origins = task.scene.env_origins[env_ids, :2]
+    center_relative = centers - origins
+
+    # Start steering while the center is still well inside its workspace.  A
+    # final clamp is only a numerical guard; it never reflects velocity, so it
+    # cannot create an instantaneous 180-degree target-yaw change.
+    if boundary_margin_ratio > 0.0 and boundary_steering_weight > 0.0:
+        margin = center_half_range * boundary_margin_ratio
+        if margin > 0.0:
+            inward_force = torch.zeros_like(center_direction)
+            inward_force[:, 0] = torch.clamp(
+                (-center_half_range + margin - center_relative[:, 0]) / margin,
+                min=0.0,
+                max=1.0,
+            ) - torch.clamp(
+                (center_relative[:, 0] - (center_half_range - margin)) / margin,
+                min=0.0,
+                max=1.0,
+            )
+            inward_force[:, 1] = torch.clamp(
+                (-center_half_range + margin - center_relative[:, 1]) / margin,
+                min=0.0,
+                max=1.0,
+            ) - torch.clamp(
+                (center_relative[:, 1] - (center_half_range - margin)) / margin,
+                min=0.0,
+                max=1.0,
+            )
+            center_direction = F.normalize(
+                center_direction + boundary_steering_weight * inward_force,
+                p=2,
+                dim=-1,
+            )
+
+    center_velocity = center_speed.unsqueeze(-1) * center_direction
+    new_center_relative = torch.clamp(
+        center_relative + center_velocity * event_interval_s,
+        min=-center_half_range,
+        max=center_half_range,
+    )
+    # Use the actual displacement so yaw stays coupled to motion even at the
+    # numerical boundary guard.
+    center_velocity = (new_center_relative - center_relative) / event_interval_s
+    centers = origins + new_center_relative
+
+    target_indices = torch.arange(
+        len(goal_attr_names), device=task.device, dtype=centers.dtype
+    )
+    target_angles = formation_phase.unsqueeze(-1) + (
+        2.0 * math.pi * target_indices / len(goal_attr_names)
+    )
+    offsets = formation_radius * torch.stack(
+        (torch.cos(target_angles), torch.sin(target_angles)), dim=-1
+    )
+    tangential_velocity = formation_turn_rate[:, None, None] * formation_radius * torch.stack(
+        (-torch.sin(target_angles), torch.cos(target_angles)), dim=-1
+    )
+    target_velocities = center_velocity[:, None, :] + tangential_velocity
+    target_yaws = torch.atan2(target_velocities[..., 1], target_velocities[..., 0])
+
+    for index, goal_attr_name in enumerate(goal_attr_names):
+        goal = getattr(task, goal_attr_name)
+        goal[env_ids, :2] = centers + offsets[:, index]
+        goal[env_ids, 3:7] = 0.0
+        goal[env_ids, 3] = torch.cos(0.5 * target_yaws[:, index])
+        goal[env_ids, 6] = torch.sin(0.5 * target_yaws[:, index])
+
+    task._target_formation_center[env_ids] = centers
+    task._target_formation_center_heading[env_ids] = center_heading
+    task._target_formation_center_turn_rate[env_ids] = center_turn_rate
+    task._target_formation_phase[env_ids] = formation_phase
+    task._target_formation_turn_rate[env_ids] = formation_turn_rate
 
 ###############################################################################
 # Scene and event configuration
@@ -96,16 +228,18 @@ class MarlWaypointTaskCfg(GroundMarlEnvCfg):
     # for every rover in every parallel environment at reset, then may drift
     # by one step at the configured interval.  Set both values to ``0`` for
     # the previous zero-latency MARL behavior.
-    # action_delay_steps: int | tuple[int, int] = (0, 3)
-    action_delay_steps: int | tuple[int, int] = 0
+    action_delay_steps: int | tuple[int, int] = (0, 3)
+    # action_delay_steps: int | tuple[int, int] = 0
     action_delay_on_step_change_freq: float = 1.0
     action_delay_on_step_change_prob: float = 0.01
-    # observation_delay_steps: int | tuple[int, int] = (0, 1)
-    observation_delay_steps: int | tuple[int, int] = 0
+    observation_delay_steps: int | tuple[int, int] = (0, 1)
+    # observation_delay_steps: int | tuple[int, int] = 0
     observation_delay_on_step_change_freq: float = 1.0
     observation_delay_on_step_change_prob: float = 0.01
 
-    # -- Moving waypoint event (matches the single-rover SRB task) ----------
+    # -- Moving waypoint event ----------------------------------------------
+    # One rover uses the original SRB random-walk target.  Multi-rover runs
+    # use a shared, bounded-curvature target formation below.
     target_event_interval_s: float = 0.05
     target_pos_step_range: tuple[float, float] = (0.005, 0.01)
     target_pos_smoothness: float = 0.99
@@ -114,19 +248,18 @@ class MarlWaypointTaskCfg(GroundMarlEnvCfg):
     target_boundary_steering_margin_ratio: float = 0.1
     target_boundary_steering_weight: float = 2.0
     target_pos_range_ratio: float = 0.9
-    multi_rover_target_motion_half_range: float = 6.0
-    """Outward extent (m) of a multi-rover target-motion corridor.
-
-    Multi-rover targets begin at their rover's compact reset-window center,
-    then move through a large, disjoint outward corridor. This preserves early
-    interaction risk while avoiding frequent boundary reversals.
-    """
-    multi_rover_target_lateral_half_range: float = 3.0
-    """Half-width (m) perpendicular to a multi-rover target's outward motion."""
-    multi_rover_target_inner_margin: float = 0.25
-    """Distance (m) each target corridor extends toward the shared start area."""
-    multi_rover_spawn_radius: float = 1.0
-    """Radius (m) of the compact circular multi-rover reset layout."""
+    multi_rover_formation_radius: float = 1.0
+    """Radius (m) of the initial and moving regular-polygon target formation."""
+    multi_rover_target_center_half_range: float = 6.0
+    """Half-width (m) of the formation center's large shared workspace."""
+    multi_rover_target_speed_range: tuple[float, float] = (0.05, 0.10)
+    """Formation-center ground speed range in m/s."""
+    multi_rover_target_center_turn_rate_max: float = math.radians(15.0)
+    """Maximum smooth formation-center turn rate in rad/s."""
+    multi_rover_target_formation_turn_rate_max: float = math.radians(8.0)
+    """Maximum smooth polygon rotation rate in rad/s."""
+    multi_rover_target_turn_smoothness: float = 0.98
+    """Autocorrelation of both target turn-rate processes at each 0.05 s update."""
 
     # -- Observation noise (matches the single-rover SRB task) -------------
     # Noise is per coordinate.  Each directed observer-to-entity XY relation
@@ -148,15 +281,53 @@ class MarlWaypointTaskCfg(GroundMarlEnvCfg):
     target_marker_cfg: VisualizationMarkersCfg = VisualizationMarkersCfg(
         prim_path="/Visuals/marl_waypoint_targets",
         markers={
-            "target": PinnedArrowCfg(
+            "rover_1_target": PinnedArrowCfg(
                 pin_radius=0.01,
                 pin_length=2.0,
                 tail_radius=0.01,
                 tail_length=0.2,
                 head_radius=0.04,
                 head_length=0.08,
-                visual_material=PreviewSurfaceCfg(emissive_color=(0.2, 0.2, 0.8)),
-            )
+                visual_material=PreviewSurfaceCfg(emissive_color=(0.9, 0.15, 0.15)),
+            ),
+            "rover_2_target": PinnedArrowCfg(
+                pin_radius=0.01,
+                pin_length=2.0,
+                tail_radius=0.01,
+                tail_length=0.2,
+                head_radius=0.04,
+                head_length=0.08,
+                visual_material=PreviewSurfaceCfg(emissive_color=(0.15, 0.8, 0.2)),
+            ),
+            "rover_3_target": PinnedArrowCfg(
+                pin_radius=0.01,
+                pin_length=2.0,
+                tail_radius=0.01,
+                tail_length=0.2,
+                head_radius=0.04,
+                head_length=0.08,
+                visual_material=PreviewSurfaceCfg(emissive_color=(0.95, 0.8, 0.1)),
+            ),
+        },
+    )
+    rover_marker_cfg: VisualizationMarkersCfg = VisualizationMarkersCfg(
+        prim_path="/Visuals/marl_waypoint_rovers",
+        markers={
+            "rover_1": CylinderCfg(
+                radius=0.018,
+                height=0.8,
+                visual_material=PreviewSurfaceCfg(emissive_color=(0.9, 0.15, 0.15)),
+            ),
+            "rover_2": CylinderCfg(
+                radius=0.018,
+                height=0.8,
+                visual_material=PreviewSurfaceCfg(emissive_color=(0.15, 0.8, 0.2)),
+            ),
+            "rover_3": CylinderCfg(
+                radius=0.018,
+                height=0.8,
+                visual_material=PreviewSurfaceCfg(emissive_color=(0.95, 0.8, 0.1)),
+            ),
         },
     )
 
@@ -193,16 +364,29 @@ class MarlWaypointTaskCfg(GroundMarlEnvCfg):
             )
         if self.proximity_safe_distance <= 0.0:
             raise ValueError("proximity_safe_distance must be positive.")
-        if self.multi_rover_target_motion_half_range <= 0.0:
-            raise ValueError("multi_rover_target_motion_half_range must be positive.")
-        if self.multi_rover_target_lateral_half_range <= 0.0:
+        if self.multi_rover_formation_radius <= 0.0:
+            raise ValueError("multi_rover_formation_radius must be positive.")
+        if self.multi_rover_target_center_half_range <= 0.0:
             raise ValueError(
-                "multi_rover_target_lateral_half_range must be positive."
+                "multi_rover_target_center_half_range must be positive."
             )
-        if self.multi_rover_target_inner_margin < 0.0:
-            raise ValueError("multi_rover_target_inner_margin must be non-negative.")
-        if self.multi_rover_spawn_radius <= 0.0:
-            raise ValueError("multi_rover_spawn_radius must be positive.")
+        min_speed, max_speed = self.multi_rover_target_speed_range
+        if min_speed <= 0.0 or max_speed < min_speed:
+            raise ValueError(
+                "multi_rover_target_speed_range must be a positive ordered pair."
+            )
+        if self.multi_rover_target_center_turn_rate_max <= 0.0:
+            raise ValueError(
+                "multi_rover_target_center_turn_rate_max must be positive."
+            )
+        if self.multi_rover_target_formation_turn_rate_max <= 0.0:
+            raise ValueError(
+                "multi_rover_target_formation_turn_rate_max must be positive."
+            )
+        if not 0.0 <= self.multi_rover_target_turn_smoothness < 1.0:
+            raise ValueError(
+                "multi_rover_target_turn_smoothness must be in [0, 1)."
+            )
         if not 0.0 <= self.target_boundary_steering_margin_ratio < 0.5:
             raise ValueError(
                 "target_boundary_steering_margin_ratio must be in [0, 0.5)."
@@ -235,16 +419,13 @@ class MarlWaypointTaskCfg(GroundMarlEnvCfg):
                 self.spacing if self.spacing is not None else self.scene.env_spacing
             )
             if (
-                self.multi_rover_spawn_radius
-                + max(
-                    self.multi_rover_target_motion_half_range,
-                    self.multi_rover_target_lateral_half_range,
-                )
+                self.multi_rover_formation_radius
+                + self.multi_rover_target_center_half_range
                 > half_spacing
             ):
                 raise ValueError(
-                    "multi_rover_spawn_radius + "
-                    "the largest multi-rover target extent must fit within half "
+                    "multi_rover_formation_radius + "
+                    "multi_rover_target_center_half_range must fit within half "
                     "the environment spacing."
                 )
 
@@ -256,13 +437,10 @@ class MarlWaypointTaskCfg(GroundMarlEnvCfg):
             * self.target_pos_range_ratio
             * (self.spacing if self.spacing is not None else self.scene.env_spacing)
         )
-        for index, agent_id in enumerate(agent_ids):
-            target_center_x, target_center_y = self._target_center(
-                index, len(agent_ids)
-            )
+        if len(agent_ids) == 1:
             setattr(
                 self.events,
-                f"target_{agent_id}_pose_evolution",
+                f"target_{agent_ids[0]}_pose_evolution",
                 EventTermCfg(
                     func=offset_pose_natural,
                     mode="interval",
@@ -272,24 +450,60 @@ class MarlWaypointTaskCfg(GroundMarlEnvCfg):
                     ),
                     is_global_time=True,
                     params={
-                        "env_attr_name": f"_target_goal_{agent_id}",
+                        "env_attr_name": f"_target_goal_{agent_ids[0]}",
                         "pos_axes": ("x", "y"),
                         "pos_step_range": self.target_pos_step_range,
                         "pos_smoothness": self.target_pos_smoothness,
                         "pos_step_smoothness": self.target_pos_step_smoothness,
-                        "pos_bounds": self._target_motion_bounds(
-                            index,
-                            len(agent_ids),
-                            target_center_x,
-                            target_center_y,
-                            single_rover_target_bound,
-                        ),
+                        "pos_bounds": {
+                            "x": (
+                                -single_rover_target_bound,
+                                single_rover_target_bound,
+                            ),
+                            "y": (
+                                -single_rover_target_bound,
+                                single_rover_target_bound,
+                            ),
+                        },
                         "orient_yaw_only": True,
                         "orient_smoothness": self.target_orient_smoothness,
                         "boundary_steering_margin_ratio": (
                             self.target_boundary_steering_margin_ratio
                         ),
                         "boundary_steering_weight": self.target_boundary_steering_weight,
+                    },
+                ),
+            )
+        else:
+            setattr(
+                self.events,
+                "target_formation_pose_evolution",
+                EventTermCfg(
+                    func=update_marl_waypoint_target_formation,
+                    mode="interval",
+                    interval_range_s=(
+                        self.target_event_interval_s,
+                        self.target_event_interval_s,
+                    ),
+                    is_global_time=True,
+                    params={
+                        "goal_attr_names": tuple(
+                            f"_target_goal_{agent_id}" for agent_id in agent_ids
+                        ),
+                        "formation_radius": self.multi_rover_formation_radius,
+                        "center_half_range": self.multi_rover_target_center_half_range,
+                        "center_turn_rate_max": (
+                            self.multi_rover_target_center_turn_rate_max
+                        ),
+                        "formation_turn_rate_max": (
+                            self.multi_rover_target_formation_turn_rate_max
+                        ),
+                        "turn_smoothness": self.multi_rover_target_turn_smoothness,
+                        "boundary_margin_ratio": (
+                            self.target_boundary_steering_margin_ratio
+                        ),
+                        "boundary_steering_weight": self.target_boundary_steering_weight,
+                        "event_interval_s": self.target_event_interval_s,
                     },
                 ),
             )
@@ -375,68 +589,28 @@ class MarlWaypointTaskCfg(GroundMarlEnvCfg):
 
         A single rover uses the original ``[-0.5, 0.5]`` XY ranges.  The
         multi-rover layout uses evenly spaced points on a configurable circle
-        with the same 0.2 m reset jitter. Target regions use these same centers
-        and can therefore remain disjoint while providing several metres of
-        smooth target motion.
+        with the same 0.2 m reset jitter. Targets start at these same points,
+        forming a compact polygon around the shared formation center.
         """
         if count == 1:
             return 0.0, 0.0, 0.5
 
         angle = 2.0 * math.pi * index / count
         return (
-            self.multi_rover_spawn_radius * math.cos(angle),
-            self.multi_rover_spawn_radius * math.sin(angle),
+            self.multi_rover_formation_radius * math.cos(angle),
+            self.multi_rover_formation_radius * math.sin(angle),
             0.2,
         )
 
     def _target_center(self, index: int, count: int) -> tuple[float, float]:
         """Return the compact initial target position for one rover.
 
-        Multi-rover targets begin at their rover reset centers, then enter
-        their outward motion corridors. The one-rover target remains at the
-        original environment origin.
+        Multi-rover targets begin at their rover reset centers before moving
+        as a shared formation. The one-rover target remains at the original
+        environment origin.
         """
         x_center, y_center, _ = self._spawn_window(index, count)
         return x_center, y_center
-
-    def _target_motion_bounds(
-        self,
-        index: int,
-        count: int,
-        center_x: float,
-        center_y: float,
-        single_rover_target_bound: float,
-    ) -> dict[str, tuple[float, float]]:
-        """Return an original broad bound or a compact-start outward corridor."""
-        if count == 1:
-            return {
-                "x": (-single_rover_target_bound, single_rover_target_bound),
-                "y": (-single_rover_target_bound, single_rover_target_bound),
-            }
-
-        direction_x = math.cos(2.0 * math.pi * index / count)
-        direction_y = math.sin(2.0 * math.pi * index / count)
-
-        def axis_bounds(center: float, direction: float) -> tuple[float, float]:
-            if direction > 0.25:
-                return (
-                    center - self.multi_rover_target_inner_margin,
-                    center + self.multi_rover_target_motion_half_range,
-                )
-            if direction < -0.25:
-                return (
-                    center - self.multi_rover_target_motion_half_range,
-                    center + self.multi_rover_target_inner_margin,
-                )
-            return (
-                center - self.multi_rover_target_lateral_half_range,
-                center + self.multi_rover_target_lateral_half_range,
-            )
-
-        return {
-            "x": axis_bounds(center_x, direction_x),
-            "y": axis_bounds(center_y, direction_y),
-        }
 
 
 ###############################################################################
@@ -481,6 +655,22 @@ class MarlWaypointTask(GroundMarlEnv):
             setattr(self, attr_name, goal)
             self._goals[agent_id] = goal
 
+        # State for the shared multi-rover target formation.  It is explicitly
+        # reset per environment so an episode never inherits its predecessor's
+        # target heading, speed, or turn rate.
+        self._target_formation_center = self.scene.env_origins[:, :2].clone()
+        self._target_formation_center_heading = torch.zeros(
+            self.num_envs, device=self.device
+        )
+        self._target_formation_center_turn_rate = torch.zeros(
+            self.num_envs, device=self.device
+        )
+        self._target_formation_phase = torch.zeros(self.num_envs, device=self.device)
+        self._target_formation_turn_rate = torch.zeros(
+            self.num_envs, device=self.device
+        )
+        self._target_formation_speed = torch.zeros(self.num_envs, device=self.device)
+
         # XY offsets are independent for each ordered observer/entity pair.
         # ``target`` denotes the observer's own target; every other key denotes
         # a physical rover visible to that observer.
@@ -501,6 +691,7 @@ class MarlWaypointTask(GroundMarlEnv):
             for agent_id in self.cfg.possible_agents
         }
         self._target_marker = VisualizationMarkers(self.cfg.target_marker_cfg)
+        self._rover_marker = VisualizationMarkers(self.cfg.rover_marker_cfg)
 
         self._proximity_safe_distance = self.cfg.proximity_safe_distance
 
@@ -649,6 +840,31 @@ class MarlWaypointTask(GroundMarlEnv):
     # Reset and actions
     # ------------------------------------------------------------------ #
 
+    def _reset_target_formation_state(self, env_ids: Sequence[int]) -> None:
+        """Initialize a new smooth target trajectory for reset environments."""
+        if len(self.cfg.possible_agents) == 1:
+            return
+
+        num_reset_envs = len(env_ids)
+        self._target_formation_center[env_ids] = self.scene.env_origins[env_ids, :2]
+        self._target_formation_center_heading[env_ids] = torch.empty(
+            num_reset_envs, device=self.device
+        ).uniform_(-math.pi, math.pi)
+        self._target_formation_center_turn_rate[env_ids] = 0.0
+        self._target_formation_phase[env_ids] = 0.0
+        self._target_formation_turn_rate[env_ids] = 0.0
+        self._target_formation_speed[env_ids] = torch.empty(
+            num_reset_envs, device=self.device
+        ).uniform_(*self.cfg.multi_rover_target_speed_range)
+
+        # At reset all target offsets are on the formation polygon (phase 0),
+        # and their initial yaw follows the just-sampled center trajectory.
+        yaw = self._target_formation_center_heading[env_ids]
+        for goal in self._goals.values():
+            goal[env_ids, 3:7] = 0.0
+            goal[env_ids, 3] = torch.cos(0.5 * yaw)
+            goal[env_ids, 6] = torch.sin(0.5 * yaw)
+
     def _reset_idx(self, env_ids: Sequence[int]):
         """Reset rover-local buffers, targets, and episodic observation noise."""
         super()._reset_idx(env_ids)
@@ -673,6 +889,8 @@ class MarlWaypointTask(GroundMarlEnv):
                 torch.randn(len(env_ids), device=self.device)
                 * self.cfg.episodic_yaw_noise_std
             )
+
+        self._reset_target_formation_state(env_ids)
 
         for noise in self._episodic_xy_noise.values():
             noise[env_ids] = (
@@ -749,11 +967,41 @@ class MarlWaypointTask(GroundMarlEnv):
         )
 
     def _visualize_targets(self) -> None:
-        """Display one virtual target marker per rover when rendering is active."""
+        """Display matching-color virtual target and rover markers."""
         target_poses = torch.cat(
             [self._goals[agent_id] for agent_id in self.cfg.possible_agents], dim=0
         )
-        self._target_marker.visualize(target_poses[:, :3], target_poses[:, 3:7])
+        marker_indices = torch.cat(
+            [
+                torch.full(
+                    (self.num_envs,),
+                    index % 3,
+                    dtype=torch.long,
+                    device=self.device,
+                )
+                for index, _ in enumerate(self.cfg.possible_agents)
+            ]
+        )
+        self._target_marker.visualize(
+            target_poses[:, :3],
+            target_poses[:, 3:7],
+            marker_indices=marker_indices,
+        )
+
+        rover_poses = torch.cat(
+            [
+                self._robots[agent_id].data.root_link_pose_w
+                for agent_id in self.cfg.possible_agents
+            ],
+            dim=0,
+        ).clone()
+        # The line marker is centered above the body instead of inside it.
+        rover_poses[:, 2] += 0.45
+        self._rover_marker.visualize(
+            rover_poses[:, :3],
+            rover_poses[:, 3:7],
+            marker_indices=marker_indices,
+        )
 
     def _get_observations(self) -> dict[str, torch.Tensor]:
         """Return each rover's decentralized noisy planar observation.

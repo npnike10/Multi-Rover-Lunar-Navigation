@@ -23,20 +23,24 @@ goal-completion termination.
   velocity ranges.  Multi-rover runs retain those height, yaw, and velocity
   distributions but shift their XY window centers to prevent initial overlap.
 - A one-rover target starts at its environment origin with identity
-  orientation and uses SRB's XY bounds `±0.45 × environment spacing` (±14.4 m
-  at the default spacing). For two or more rovers, each target instead starts
-  at, and remains inside, a distinct persistent region centered on that
-  rover's compact reset-window center. Each target starts at that center, then
-  moves through its own disjoint outward corridor with `6.0 m` extent
-  (`env.multi_rover_target_motion_half_range`) and `3.0 m` lateral half-width
-  (`env.multi_rover_target_lateral_half_range`). The three rover reset centers
-  are spaced on a `1.0 m` radius circle (`env.multi_rover_spawn_radius`), so
-  close initial interactions remain possible while targets eventually move
-  apart. This prevents all
-  rovers from initially pursuing the same origin waypoint. Targets evolve
-  every 0.05 s via the same `offset_pose_natural` event: XY step size
-  `[0.005, 0.01]` m, position smoothness `0.99`, step-size smoothness `0.8`,
-  and yaw-only orientation with smoothness `0.8`.
+  orientation and uses SRB's original `offset_pose_natural` event with XY
+  bounds `±0.45 × environment spacing` (±14.4 m at the default spacing).
+  For two or more rovers, targets begin beside their matching rovers on a
+  regular polygon of radius `1.0 m`
+  (`env.multi_rover_formation_radius`). They then move as one shared
+  formation: its center travels at `0.05–0.10 m/s` in a large `±6.0 m`
+  workspace (`env.multi_rover_target_center_half_range`), with a smooth
+  bounded turn rate of at most `15°/s`. The polygon itself rotates smoothly at
+  at most `8°/s`. Thus targets remain near each other and initially near the
+  rovers, but follow curved trajectories rather than independent jittering or
+  straight outward corridors. Target yaw is set from each target's actual
+  instantaneous formation velocity, so yaw remains coupled to the smooth
+  target motion. All formation position, heading, speed, and turn state is
+  resampled/reset per episode.
+- Isaac Sim markers identify the pairings: rover 1 and its target are red,
+  rover 2 and its target are green, and rover 3 and its target are yellow.
+  The rover marker is pinned above the body and follows rover yaw; target
+  arrows follow target yaw. Additional rover IDs repeat those three colors.
 - Episodes end only at the 60 s time limit.
 
 ## Dec-POMDP definition
@@ -131,11 +135,9 @@ R_team = mean_i(R_i)
 `env.reward_mode` selects the returned reward: `individual` (the default)
 returns `R_i` to rover `i`; `team` returns `R_team` to every rover. The
 proximity term is therefore always assigned to the rovers in the close pair,
-even in team mode before averaging. `w_proximity` defaults to `1.0`.
-`d_safe` defaults to one Leo rover length, `0.3587 m`, and can be overridden
-with `env.proximity_safe_distance`. The pair term is zero for a single rover.
-Consequently, one rover with the default proximity weight has the original SRB
-reward exactly.
+even in team mode before averaging. The current task defaults are
+`w_proximity=100.0` and `d_safe=1.0 m`; both can be overridden. The pair term
+is zero for a single rover.
 
 ## Compatibility notes
 
