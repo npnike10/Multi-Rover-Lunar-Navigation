@@ -51,13 +51,10 @@ models:
       num_layers: 1
     output: ONE
 
-# RNNs dynamically instantiated this way require SequencedMemory 
-# to handle the temporal batches correctly.
+# PPO_RNN requests recurrent sequences from RandomMemory at training time.
 memory:
-  class: SequencedMemory
-  memory_size: 256
-  num_sequences: 16
-  sequence_length: 256
+  class: RandomMemory
+  memory_size: 128
 
 # https://skrl.readthedocs.io/en/latest/api/agents/ppo_rnn.html
 agent:

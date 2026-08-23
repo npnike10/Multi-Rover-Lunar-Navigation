@@ -12,6 +12,7 @@ XY positions for all other rovers.  The task deliberately has no RayCaster,
 IMU, terrain observation, goal-completion, or rollover signal.
 """
 
+import copy
 import math
 from typing import Literal, Sequence
 
@@ -153,8 +154,10 @@ def update_marl_waypoint_target_formation(
     offsets = formation_radius * torch.stack(
         (torch.cos(target_angles), torch.sin(target_angles)), dim=-1
     )
-    tangential_velocity = formation_turn_rate[:, None, None] * formation_radius * torch.stack(
-        (-torch.sin(target_angles), torch.cos(target_angles)), dim=-1
+    tangential_velocity = (
+        formation_turn_rate[:, None, None]
+        * formation_radius
+        * torch.stack((-torch.sin(target_angles), torch.cos(target_angles)), dim=-1)
     )
     target_velocities = center_velocity[:, None, :] + tangential_velocity
     target_yaws = torch.atan2(target_velocities[..., 1], target_velocities[..., 0])
@@ -180,6 +183,7 @@ def update_marl_waypoint_target_formation(
     task._target_formation_center_turn_rate[env_ids] = center_turn_rate
     task._target_formation_phase[env_ids] = formation_phase
     task._target_formation_turn_rate[env_ids] = formation_turn_rate
+
 
 ###############################################################################
 # Scene and event configuration
@@ -227,10 +231,15 @@ class MarlWaypointTaskCfg(GroundMarlEnvCfg):
     # 60 deg/s respectively.  Use this robot for replication of the requested
     # action bounds and scaling.
     num_rovers: int = 3
+    # robots = {
+    #     "rover_1": assets.LeoRover(),
+    #     "rover_2": assets.LeoRover(),
+    #     "rover_3": assets.LeoRover(),
+    # }
     robots = {
-        "rover_1": assets.LeoRover(),
-        "rover_2": assets.LeoRover(),
-        "rover_3": assets.LeoRover(),
+        "rover_1": assets.Perseverance(),
+        "rover_2": assets.Perseverance(),
+        "rover_3": assets.Perseverance(),
     }
 
     # -- Time ---------------------------------------------------------------
@@ -382,9 +391,7 @@ class MarlWaypointTaskCfg(GroundMarlEnvCfg):
         if self.multi_rover_formation_radius <= 0.0:
             raise ValueError("multi_rover_formation_radius must be positive.")
         if self.multi_rover_target_center_half_range <= 0.0:
-            raise ValueError(
-                "multi_rover_target_center_half_range must be positive."
-            )
+            raise ValueError("multi_rover_target_center_half_range must be positive.")
         min_speed, max_speed = self.multi_rover_target_speed_range
         if min_speed <= 0.0 or max_speed < min_speed:
             raise ValueError(
@@ -399,9 +406,7 @@ class MarlWaypointTaskCfg(GroundMarlEnvCfg):
                 "multi_rover_target_formation_turn_rate_max must be positive."
             )
         if not 0.0 <= self.multi_rover_target_turn_smoothness < 1.0:
-            raise ValueError(
-                "multi_rover_target_turn_smoothness must be in [0, 1)."
-            )
+            raise ValueError("multi_rover_target_turn_smoothness must be in [0, 1).")
         if not 0.0 <= self.target_boundary_steering_margin_ratio < 0.5:
             raise ValueError(
                 "target_boundary_steering_margin_ratio must be in [0, 0.5)."
@@ -424,8 +429,10 @@ class MarlWaypointTaskCfg(GroundMarlEnvCfg):
         # All agents in this task are homogeneous Leo waypoint navigators.
         # Rebuild the mapping from the public ``num_rovers`` override before
         # the base configuration creates scene assets and action terms.
+        robot_prototype = next(iter(self.robots.values()))
         self.robots = {
-            f"rover_{index + 1}": assets.LeoRover() for index in range(self.num_rovers)
+            f"rover_{index + 1}": copy.deepcopy(robot_prototype)
+            for index in range(self.num_rovers)
         }
         agent_ids = list(self.robots.keys())
 
@@ -622,9 +629,7 @@ class MarlWaypointTaskCfg(GroundMarlEnvCfg):
         if count == 1:
             return 0.0, 0.0, 0.5
 
-        x_center, y_center = self._formation_slot_center(
-            (index + 1) % count, count
-        )
+        x_center, y_center = self._formation_slot_center((index + 1) % count, count)
         return x_center, y_center, 0.2
 
     def _target_center(self, index: int, count: int) -> tuple[float, float]:
