@@ -33,7 +33,12 @@ from srb.core.mdp import offset_pose_natural
 from srb.core.sim import CylinderCfg, PreviewSurfaceCfg
 from srb.core.sim.spawners.shapes.extras.cfg import PinnedArrowCfg
 from srb.utils.cfg import configclass
-from srb.utils.math import matrix_from_quat, subtract_frame_transforms
+from srb.utils.math import (
+    matrix_from_quat,
+    quat_from_euler_xyz,
+    slerp,
+    subtract_frame_transforms,
+)
 
 
 def update_marl_waypoint_target_formation(
@@ -45,6 +50,7 @@ def update_marl_waypoint_target_formation(
     center_turn_rate_max: float,
     formation_turn_rate_max: float,
     turn_smoothness: float,
+    orient_smoothness: float,
     boundary_margin_ratio: float,
     boundary_steering_weight: float,
     event_interval_s: float,
@@ -152,13 +158,22 @@ def update_marl_waypoint_target_formation(
     )
     target_velocities = center_velocity[:, None, :] + tangential_velocity
     target_yaws = torch.atan2(target_velocities[..., 1], target_velocities[..., 0])
+    desired_target_orientations = quat_from_euler_xyz(
+        torch.zeros_like(target_yaws),
+        torch.zeros_like(target_yaws),
+        target_yaws,
+    )
 
     for index, goal_attr_name in enumerate(goal_attr_names):
         goal = getattr(task, goal_attr_name)
         goal[env_ids, :2] = centers + offsets[:, index]
-        goal[env_ids, 3:7] = 0.0
-        goal[env_ids, 3] = torch.cos(0.5 * target_yaws[:, index])
-        goal[env_ids, 6] = torch.sin(0.5 * target_yaws[:, index])
+        # Match the single-rover target's yaw behavior: orientation follows
+        # the motion-derived desired yaw through a quaternion low-pass filter.
+        goal[env_ids, 3:7] = slerp(
+            goal[env_ids, 3:7],
+            desired_target_orientations[:, index],
+            1.0 - orient_smoothness,
+        )
 
     task._target_formation_center[env_ids] = centers
     task._target_formation_center_heading[env_ids] = center_heading
@@ -499,6 +514,7 @@ class MarlWaypointTaskCfg(GroundMarlEnvCfg):
                             self.multi_rover_target_formation_turn_rate_max
                         ),
                         "turn_smoothness": self.multi_rover_target_turn_smoothness,
+                        "orient_smoothness": self.target_orient_smoothness,
                         "boundary_margin_ratio": (
                             self.target_boundary_steering_margin_ratio
                         ),

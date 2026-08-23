@@ -35,10 +35,12 @@ goal-completion termination.
   bounded turn rate of at most `15°/s`. The polygon itself rotates smoothly at
   at most `8°/s`. Thus targets remain near each other and initially near the
   rovers, but follow curved trajectories rather than independent jittering or
-  straight outward corridors. Target yaw is set from each target's actual
-  instantaneous formation velocity, so yaw remains coupled to the smooth
-  target motion. All formation position, heading, speed, and turn state is
-  resampled/reset per episode.
+  straight outward corridors. Each target's desired yaw is derived from its
+  actual instantaneous formation velocity, then quaternion-SLERP filtered
+  with the same `0.8` orientation smoothness as the single-rover task. Thus
+  yaw remains motion-coupled without visible frame-to-frame flips. All
+  formation position, heading, speed, and turn state is resampled/reset per
+  episode.
 - Isaac Sim markers identify the pairings: rover 1 and its target are red,
   rover 2 and its target are green, and rover 3 and its target are yellow.
   The rover marker is a vertical line above the body; target arrows follow
