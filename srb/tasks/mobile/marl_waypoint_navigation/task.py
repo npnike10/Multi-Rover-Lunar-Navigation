@@ -584,33 +584,41 @@ class MarlWaypointTaskCfg(GroundMarlEnvCfg):
                 f"{change_probability}."
             )
 
-    def _spawn_window(self, index: int, count: int) -> tuple[float, float, float]:
-        """Return a separated SRB-style reset window for one rover.
-
-        A single rover uses the original ``[-0.5, 0.5]`` XY ranges.  The
-        multi-rover layout uses evenly spaced points on a configurable circle
-        with the same 0.2 m reset jitter. Targets start at these same points,
-        forming a compact polygon around the shared formation center.
-        """
+    def _formation_slot_center(self, index: int, count: int) -> tuple[float, float]:
+        """Return one target's initial regular-polygon formation slot."""
         if count == 1:
-            return 0.0, 0.0, 0.5
+            return 0.0, 0.0
 
         angle = 2.0 * math.pi * index / count
         return (
             self.multi_rover_formation_radius * math.cos(angle),
             self.multi_rover_formation_radius * math.sin(angle),
-            0.2,
         )
+
+    def _spawn_window(self, index: int, count: int) -> tuple[float, float, float]:
+        """Return a reset window near the next rover's initial target slot.
+
+        A single rover uses the original ``[-0.5, 0.5]`` XY ranges.  For a
+        team, rover ``i`` starts near target slot ``i + 1`` (cyclically), with
+        0.2 m reset jitter.  This makes each rover initially close to another
+        rover's marker rather than its own while preserving a compact layout.
+        """
+        if count == 1:
+            return 0.0, 0.0, 0.5
+
+        x_center, y_center = self._formation_slot_center(
+            (index + 1) % count, count
+        )
+        return x_center, y_center, 0.2
 
     def _target_center(self, index: int, count: int) -> tuple[float, float]:
         """Return the compact initial target position for one rover.
 
-        Multi-rover targets begin at their rover reset centers before moving
-        as a shared formation. The one-rover target remains at the original
-        environment origin.
+        Multi-rover targets begin at their own formation slots, while rovers
+        begin near the next target slot to create initial cross-traffic. The
+        one-rover target remains at the original environment origin.
         """
-        x_center, y_center, _ = self._spawn_window(index, count)
-        return x_center, y_center
+        return self._formation_slot_center(index, count)
 
 
 ###############################################################################

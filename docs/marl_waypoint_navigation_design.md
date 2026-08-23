@@ -25,9 +25,11 @@ goal-completion termination.
 - A one-rover target starts at its environment origin with identity
   orientation and uses SRB's original `offset_pose_natural` event with XY
   bounds `±0.45 × environment spacing` (±14.4 m at the default spacing).
-  For two or more rovers, targets begin beside their matching rovers on a
-  regular polygon of radius `1.0 m`
-  (`env.multi_rover_formation_radius`). They then move as one shared
+  For two or more rovers, targets begin on a regular polygon of radius `1.0 m`
+  (`env.multi_rover_formation_radius`), while rover `i` starts near target
+  slot `i+1` cyclically. With three rovers, every rover begins about `1.73 m`
+  from its own target but near another rover's target, creating immediate
+  cross-traffic. Targets then move as one shared
   formation: its center travels at `0.05–0.10 m/s` in a large `±6.0 m`
   workspace (`env.multi_rover_target_center_half_range`), with a smooth
   bounded turn rate of at most `15°/s`. The polygon itself rotates smoothly at
@@ -39,8 +41,8 @@ goal-completion termination.
   resampled/reset per episode.
 - Isaac Sim markers identify the pairings: rover 1 and its target are red,
   rover 2 and its target are green, and rover 3 and its target are yellow.
-  The rover marker is pinned above the body and follows rover yaw; target
-  arrows follow target yaw. Additional rover IDs repeat those three colors.
+  The rover marker is a vertical line above the body; target arrows follow
+  target yaw. Additional rover IDs repeat those three colors.
 - Episodes end only at the 60 s time limit.
 
 ## Dec-POMDP definition
